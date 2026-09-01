@@ -149,6 +149,7 @@ namespace
         OPT_USE_XBOX,
         OPT_XGMODE,
     #endif
+        OPT_COMPRESSION_DOMAIN_MIPS, // hyeon
         OPT_FLAGS_MAX,
         OPT_FILELIST,
         OPT_WIDTH,
@@ -274,6 +275,7 @@ namespace
         { L"alpha-threshold",       OPT_ALPHA_THRESHOLD },
         { L"alpha-weight",          OPT_ALPHA_WEIGHT },
         { L"bad-tails",             OPT_DDS_BAD_DXTN_TAILS },
+        { L"compression-domain-mips", OPT_COMPRESSION_DOMAIN_MIPS},
         { L"block-compress",        OPT_BC_COMPRESS },
         { L"color-key",             OPT_COLORKEY },
         { L"dword-alignment",       OPT_DDS_DWORD_ALIGN },
@@ -871,6 +873,7 @@ namespace
             L"   --reconstruct-z     Rebuild Z (blue) channel assuming X/Y are normals\n"
             L"   --swizzle <rgba>    Swizzle image channels using HLSL-style mask\n"
             L"\n"
+            L"   --compression-domain-mips    generate lower mip levels directly from opaque compressed mip 0\n"
             L"   '-- ' is needed if any input filepath starts with the '-' or '/' character\n";
 
         wprintf(L"%ls", s_usage);
