@@ -3649,6 +3649,64 @@ int __cdecl wmain(_In_ int argc, _In_z_count_(argc) wchar_t* argv[])
                     assert(info.mipLevels == tinfo.mipLevels);
                     assert(info.miscFlags == tinfo.miscFlags);
                     assert(info.dimension == tinfo.dimension);
+
+                    // A precompressed one-level DDS already contains the exact
+                    // mip 0 required by the compression-domain algorithm. Reuse
+                    // it directly so benchmarks can exclude base-level encoding.
+                    if (useCompressionDomainMips
+                        && (!tMips || info.mipLevels != tMips)
+                        && (info.width > 1 || info.height > 1))
+                    {
+                        wprintf(L"\n[Compression Domain Mips] compressed mip 0 reused");
+
+                        const Image* compressedBase = image->GetImage(0, 0, 0);
+                        assert(compressedBase);
+
+                        ScratchImage domainMipChain;
+                        bool usedGpu = false;
+                        LARGE_INTEGER mipGenerationStart = {};
+                        if (dwOptions & (UINT64_C(1) << OPT_TIMING))
+                        {
+                            std::ignore = QueryPerformanceCounter(&mipGenerationStart);
+                        }
+                        if (adapter >= 0 && !(dwOptions & (UINT64_C(1) << OPT_NOGPU)))
+                        {
+                            if (!pDevice)
+                            {
+                                CreateDevice(adapter, pDevice.GetAddressOf());
+                            }
+
+                            if (pDevice)
+                            {
+                                hr = GenerateCompressedMipMaps(pDevice.Get(), *compressedBase, tMips, domainMipChain);
+                                usedGpu = SUCCEEDED(hr);
+                            }
+                        }
+
+                        if (!usedGpu)
+                        {
+                            hr = GenerateCompressedMipMaps(*compressedBase, tMips, domainMipChain);
+                        }
+                        if (FAILED(hr))
+                        {
+                            wprintf(L"\nFAILED [compression-domain-mips] (%08X%ls)\n",
+                                static_cast<unsigned int>(hr), GetErrorDesc(hr));
+                            retVal = 1;
+                            continue;
+                        }
+
+                        wprintf(usedGpu ? L" [GPU]" : L" [CPU]");
+                        if (dwOptions & (UINT64_C(1) << OPT_TIMING))
+                        {
+                            LARGE_INTEGER mipGenerationEnd = {};
+                            std::ignore = QueryPerformanceCounter(&mipGenerationEnd);
+                            const LONGLONG mipDelta = mipGenerationEnd.QuadPart - mipGenerationStart.QuadPart;
+                            wprintf(L" [mip generation: %.6f seconds]",
+                                double(mipDelta) / double(qpcFreq.QuadPart));
+                        }
+                        *image = std::move(domainMipChain);
+                        info.mipLevels = image->GetMetadata().mipLevels;
+                    }
                 }
                 else
                 {
@@ -3738,6 +3796,11 @@ int __cdecl wmain(_In_ int argc, _In_z_count_(argc) wchar_t* argv[])
 
                         ScratchImage domainMipChain;
                         bool usedGpu = false;
+                        LARGE_INTEGER mipGenerationStart = {};
+                        if (dwOptions & (UINT64_C(1) << OPT_TIMING))
+                        {
+                            std::ignore = QueryPerformanceCounter(&mipGenerationStart);
+                        }
                         // Use the experimental DirectCompute path only when an adapter is selected explicitly.
                         if (adapter >= 0 && !(dwOptions & (UINT64_C(1) << OPT_NOGPU)))
                         {
@@ -3765,6 +3828,14 @@ int __cdecl wmain(_In_ int argc, _In_z_count_(argc) wchar_t* argv[])
                         }
 
                         wprintf(usedGpu ? L" [GPU]" : L" [CPU]");
+                        if (dwOptions & (UINT64_C(1) << OPT_TIMING))
+                        {
+                            LARGE_INTEGER mipGenerationEnd = {};
+                            std::ignore = QueryPerformanceCounter(&mipGenerationEnd);
+                            const LONGLONG mipDelta = mipGenerationEnd.QuadPart - mipGenerationStart.QuadPart;
+                            wprintf(L" [mip generation: %.6f seconds]",
+                                double(mipDelta) / double(qpcFreq.QuadPart));
+                        }
                         *timage = std::move(domainMipChain);
                         info.mipLevels = timage->GetMetadata().mipLevels;
                     }
