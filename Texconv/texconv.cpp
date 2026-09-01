@@ -275,7 +275,7 @@ namespace
         { L"alpha-threshold",       OPT_ALPHA_THRESHOLD },
         { L"alpha-weight",          OPT_ALPHA_WEIGHT },
         { L"bad-tails",             OPT_DDS_BAD_DXTN_TAILS },
-        { L"compression-domain-mips", OPT_COMPRESSION_DOMAIN_MIPS},
+        { L"compression-domain-mips", OPT_COMPRESSION_DOMAIN_MIPS}, // hyeon 
         { L"block-compress",        OPT_BC_COMPRESS },
         { L"color-key",             OPT_COLORKEY },
         { L"dword-alignment",       OPT_DDS_DWORD_ALIGN },
@@ -873,7 +873,7 @@ namespace
             L"   --reconstruct-z     Rebuild Z (blue) channel assuming X/Y are normals\n"
             L"   --swizzle <rgba>    Swizzle image channels using HLSL-style mask\n"
             L"\n"
-            L"   --compression-domain-mips    generate lower mip levels directly from opaque compressed mip 0\n"
+            L"   --compression-domain-mips    generate lower mip levels directly from opaque compressed mip 0\n" // hyeon
             L"   '-- ' is needed if any input filepath starts with the '-' or '/' character\n";
 
         wprintf(L"%ls", s_usage);
@@ -3310,6 +3310,13 @@ int __cdecl wmain(_In_ int argc, _In_z_count_(argc) wchar_t* argv[])
         }
 
         // --- Generate mips -----------------------------------------------------------
+        // Lee: Check our method request 
+        const bool useCompressionDomainMips = (dwOptions & (UINT64_C(1) << OPT_COMPRESSION_DOMAIN_MIPS)) != 0;
+        if (useCompressionDomainMips)
+        {
+            wprintf(L"\n[Compression Domain Mips] enabled\n");
+        }
+
         TEX_FILTER_FLAGS dwFilter3D = dwFilter;
         if (!ispow2(info.width) || !ispow2(info.height) || !ispow2(info.depth))
         {
@@ -3419,7 +3426,8 @@ int __cdecl wmain(_In_ int argc, _In_z_count_(argc) wchar_t* argv[])
             }
         }
 
-        if ((!tMips || info.mipLevels != tMips) && (info.width > 1 || info.height > 1 || info.depth > 1))
+        // Lee: add our method option
+        if (!useCompressionDomainMips && (!tMips || info.mipLevels != tMips) && (info.width > 1 || info.height > 1 || info.depth > 1))
         {
             std::unique_ptr<ScratchImage> timage(new (std::nothrow) ScratchImage);
             if (!timage)
@@ -3716,6 +3724,25 @@ int __cdecl wmain(_In_ int argc, _In_z_count_(argc) wchar_t* argv[])
                     if (FAILED(hr))
                     {
                         wprintf(L" FAILED [compress] (%08X%ls)\n", static_cast<unsigned int>(hr), GetErrorDesc(hr));
+                        retVal = 1;
+                        continue;
+                    }
+
+                    // Lee: generate mipmap in compression domain 
+                    if (useCompressionDomainMips)
+                    {
+                        wprintf(L"\n[Compression Domain Mips] compressed mip 0 ready");
+
+                        auto compressedBase = timage->GetImage(0, 0, 0);
+                        assert(compressedBase);
+
+                        ScratchImage domainMipChain;
+                        hr = GenerateCompressedMipMaps(*compressedBase, tMips, domainMipChain);
+                        if (FAILED(hr)) 
+                        {
+                            wprintf(L"\nFAILED [compression-domain-mips] (%08X%ls)\n", static_cast<unsigned int>(hr), GetErrorDesc(hr));
+                        }
+
                         retVal = 1;
                         continue;
                     }

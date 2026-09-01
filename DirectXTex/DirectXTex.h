@@ -846,6 +846,11 @@ namespace DirectX
         _In_ TEX_FILTER_FLAGS filter, _In_ size_t levels, _Inout_ ScratchImage& mipChain);
         // levels of '0' indicates a full mipchain, otherwise is generates that number of total levels (including the source base image)
         // Defaults to Fant filtering which is equivalent to a box filter
+    DIRECTX_TEX_API HRESULT __cdecl GenerateCompressedMipMaps(
+        _In_ const Image& baseImage,
+        _In_ size_t levels,
+        _Out_ ScratchImage& mipChain) noexcept;
+        // Lee: Our main method function
 
     DIRECTX_TEX_API HRESULT __cdecl GenerateMipMaps3D(
         _In_reads_(depth) const Image* baseImages, _In_ size_t depth, _In_ TEX_FILTER_FLAGS filter, _In_ size_t levels,

@@ -114,6 +114,7 @@ set(LIBRARY_SOURCES
     DirectXTex/DirectXTexHDR.cpp
     DirectXTex/DirectXTexImage.cpp
     DirectXTex/DirectXTexMipmaps.cpp
+    DirectXTex/DirectXTexCompressedMips.cpp # Lee: Our file
     DirectXTex/DirectXTexMisc.cpp
     DirectXTex/DirectXTexNormalMaps.cpp
     DirectXTex/DirectXTexPMAlpha.cpp
