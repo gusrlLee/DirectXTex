@@ -3741,10 +3741,12 @@ int __cdecl wmain(_In_ int argc, _In_z_count_(argc) wchar_t* argv[])
                         if (FAILED(hr)) 
                         {
                             wprintf(L"\nFAILED [compression-domain-mips] (%08X%ls)\n", static_cast<unsigned int>(hr), GetErrorDesc(hr));
+                            retVal = 1;
+                            continue;
                         }
 
-                        retVal = 1;
-                        continue;
+                        *timage = std::move(domainMipChain);
+                        info.mipLevels = timage->GetMetadata().mipLevels;
                     }
 
                     auto& tinfo = timage->GetMetadata();

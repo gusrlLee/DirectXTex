@@ -1,7 +1,13 @@
 #include "DirectXTexP.h"
 #include "BC.h"
 
+#include <algorithm>
+#include <array>
+#include <cstddef>
+#include <cstdint>
 #include <immintrin.h>
+#include <memory>
+#include <new>
 
 using namespace DirectX;
 static_assert(sizeof(D3DX_BC1) == 8, "D3DX_BC1 must be 8 bytes");
@@ -27,6 +33,56 @@ namespace
     {
         return _mm_castsi128_ps(_mm_add_epi32(_mm_castps_si128(value0), _mm_castps_si128(value1)));
     }
+
+    // Subtract every 32-bit integer SIMD lane.
+    inline XMVECTOR SubtractInt32(FXMVECTOR value0, FXMVECTOR value1) noexcept
+    {
+        return _mm_castsi128_ps(_mm_sub_epi32(_mm_castps_si128(value0), _mm_castps_si128(value1)));
+    }
+
+    // Compare signed 32-bit lanes. BC1 packed values are always below INT32_MAX.
+    inline XMVECTOR GreaterInt32(FXMVECTOR value0, FXMVECTOR value1) noexcept
+    {
+        return _mm_castsi128_ps(_mm_cmpgt_epi32(_mm_castps_si128(value0), _mm_castps_si128(value1)));
+    }
+
+    // Divide palette sums in [0, 765] by 3 using integer SIMD.
+    inline XMVECTOR DividePaletteSumBy3(FXMVECTOR value) noexcept
+    {
+        // For values up to 765, (value * 683) >> 11
+        // is exactly equal to integer division by 3.
+        XMVECTOR product = AddInt32(ShiftLeft32<9>(value), ShiftLeft32<7>(value));
+        product = AddInt32(product, ShiftLeft32<5>(value));
+        product = AddInt32(product, ShiftLeft32<3>(value));
+        product = AddInt32(product, ShiftLeft32<1>(value));
+        product = AddInt32(product, value);
+
+        return ShiftRight32<11>(product);
+    }
+
+    // Build the sRGB8 lookup table with DirectXMath conversion rules.
+    inline const std::array<float, 256>& GetSrgb8ToLinearTable() noexcept
+    {
+        static const std::array<float, 256> table = []
+        {
+            std::array<float, 256> values{};
+
+            constexpr float scale = 1.0f / 255.0f;
+
+            for (size_t index = 0; index < values.size(); ++index)
+            {
+                const float srgb = static_cast<float>(index) * scale;
+                const XMVECTOR replicated = XMVectorReplicate(srgb);
+                const XMVECTOR linear = XMColorSRGBToRGB(replicated);
+
+                values[index] = XMVectorGetX(linear);
+            }
+
+            return values;
+        }();
+
+        return table;
+    }
 }
 
 // Lee: Four independent BC1 blocks stored in SIMD lane.
@@ -45,16 +101,118 @@ struct RGB8Batch
     XMVECTOR b;
 };
 
-// Lee: Four decoded BC1 palette colors for four SIMD lanes.
-struct BC1PaletteBatch
+// Lee: Linear RGB palette colors for four opaque BC1 blocks.
+struct LinearPaletteBC1Batch
 {
-    RGB8Batch color[4];
+    XMVECTOR c0R;
+    XMVECTOR c0G;
+    XMVECTOR c0B;
+
+    XMVECTOR c1R;
+    XMVECTOR c1G;
+    XMVECTOR c1B;
+
+    XMVECTOR c2R;
+    XMVECTOR c2G;
+    XMVECTOR c2B;
+
+    XMVECTOR c3R;
+    XMVECTOR c3G;
+    XMVECTOR c3B;
 };
 
-// Lee: Four SIMD batches forming one downsampled 4x4 BC1 block
-struct DownsampledBC1Block
+// Linear RGB means of four 2x2 quadrants for four BC1 blocks.
+struct QuadrantMeansBatch
 {
-    RGB8Batch texelGroup[4];
+    XMVECTOR q0R;
+    XMVECTOR q0G;
+    XMVECTOR q0B;
+
+    XMVECTOR q1R;
+    XMVECTOR q1G;
+    XMVECTOR q1B;
+
+    XMVECTOR q2R;
+    XMVECTOR q2G;
+    XMVECTOR q2B;
+
+    XMVECTOR q3R;
+    XMVECTOR q3G;
+    XMVECTOR q3B;
+};
+
+// Linear RGB values for four independent SIMD lanes.
+struct LinearRGBBatch
+{
+    XMVECTOR r;
+    XMVECTOR g;
+    XMVECTOR b;
+};
+
+// Symmetric 3x3 covariance matrices for four SIMD lanes.
+struct CovarianceMatrixBatch
+{
+    XMVECTOR rr;
+    XMVECTOR gg;
+    XMVECTOR bb;
+
+    XMVECTOR rg;
+    XMVECTOR rb;
+    XMVECTOR gb;
+};
+
+// Mean and within-block covariance for four parent BC1 blocks.
+struct ParentStatisticsBatch
+{
+    LinearRGBBatch mean;
+    CovarianceMatrixBatch withinCovariance;
+};
+
+// Linear means of the four source blocks used by one destination block.
+struct SourceBlockMeansBatch
+{
+    LinearRGBBatch p00;
+    LinearRGBBatch p10;
+    LinearRGBBatch p01;
+    LinearRGBBatch p11;
+};
+
+// Two RGB endpoints for four independent blocks.
+struct EndpointPairBatch
+{
+    LinearRGBBatch p0;
+    LinearRGBBatch p1;
+};
+
+// Projection axis and center used by the PCA range search.
+struct ProjectionContextBatch
+{
+    LinearRGBBatch axis;
+    LinearRGBBatch mean;
+};
+
+// State used while assigning least-squares palette weights.
+struct LeastSquaresContextBatch
+{
+    LinearRGBBatch p0;
+    LinearRGBBatch direction;
+    XMVECTOR inverseLengthSquared;
+};
+
+// Sufficient statistics for the endpoint least-squares solve.
+struct LeastSquaresAccumulatorBatch
+{
+    XMVECTOR weightSum;
+    XMVECTOR weightSquaredSum;
+    LinearRGBBatch weighted;
+};
+
+// Scalar linear block mean used by the higher mip mean pyramid.
+struct LinearBlockMean
+{
+    float r;
+    float g;
+    float b;
 };
 
 // Lee: Load four BC1 blocks into SIMD lane
@@ -89,209 +247,1141 @@ inline RGB8Batch DecodeRGB565Batch(XMVECTOR packed) noexcept
     return result;
 }
 
-// Lee: Return an all-one mask for BC1 blocks using four-color mode.
-inline XMVECTOR GetBC1FourColorMask(FXMVECTOR color0, FXMVECTOR color1) noexcept
+// Normalize four unsigned 8-bit values into the [0, 1] range.
+inline XMVECTOR NormalizeUNorm8Batch(FXMVECTOR values) noexcept
 {
-    return _mm_castsi128_ps(_mm_cmpgt_epi32(_mm_castps_si128(color0), _mm_castps_si128(color1)));
+    const XMVECTOR floatValues = XMConvertVectorUIntToFloat(values, 0);
+    return XMVectorScale(floatValues,1.0f / 255.0f);
 }
 
-// Lee: Extract one 2-bit selector from four BC1 blocks in parallel.
-template<uint32_t TexelIndex>
-inline XMVECTOR ExtractBC1Selector(FXMVECTOR selectors) noexcept
+// Convert four sRGB8 code values to linear values.
+inline XMVECTOR Srgb8ToLinearBatch(FXMVECTOR values) noexcept
 {
-    static_assert(TexelIndex < 16, "BC1 texel index must be below 16");
-    const XMVECTOR selectorMask = XMVectorReplicateInt(0x3u);
+    const auto& table = GetSrgb8ToLinearTable();
 
-    return XMVectorAndInt(ShiftRight32<TexelIndex * 2>(selectors), selectorMask);
+    return XMVectorSet(
+        table[XMVectorGetIntX(values)],
+        table[XMVectorGetIntY(values)],
+        table[XMVectorGetIntZ(values)],
+        table[XMVectorGetIntW(values)]);
 }
 
-// Lee: Select one palette channel using four BC1 selector in parallel.
-inline XMVECTOR SelectBC1PaletteChannel(
-    FXMVECTOR selectors,
-    FXMVECTOR color0,
-    FXMVECTOR color1,
-    GXMVECTOR color2,
-    HXMVECTOR color3) noexcept
+// Convert RGB8 code values according to the texture color space.
+template<bool IsSrgb>
+inline XMVECTOR ConvertRGB8ToLinearBatch(FXMVECTOR values) noexcept
 {
-    const XMVECTOR one = XMVectorReplicateInt(1u);
-    const XMVECTOR two = XMVectorReplicateInt(2u);
-
-    const XMVECTOR lowBit = XMVectorAndInt(selectors, one);
-    const XMVECTOR highBit = XMVectorAndInt(selectors, two);
-
-    const XMVECTOR lowMask = XMVectorEqualInt(lowBit, one);
-    const XMVECTOR highMask = XMVectorEqualInt(highBit, two);
-
-    // Select color 0/1 and color 2/3 using the low selector bit.
-    const XMVECTOR lowPair = XMVectorSelect(color0, color1, lowMask);
-    const XMVECTOR highPair = XMVectorSelect(color2, color3, lowMask);
-
-    // Select between the two pairs using the high selector bit.
-    return XMVectorSelect(lowPair, highPair, highMask);
+    if (IsSrgb)
+    {
+        return Srgb8ToLinearBatch(values);
+    }
+    else
+    {
+        return NormalizeUNorm8Batch(values);
+    }
 }
 
-// Lee:  Interpolate (color0 + color1) / 2 in four SIMD lanes.
-inline XMVECTOR InterpolateOneToOne(FXMVECTOR color0, FXMVECTOR color1) noexcept
+// Lee: Count selector flags in four 2x2 regions using SWAR 
+inline XMVECTOR Count2x2Regions(FXMVECTOR flags) noexcept
 {
-    const XMVECTOR color0Float = XMConvertVectorUIntToFloat(color0, 0);
-    const XMVECTOR color1Float = XMConvertVectorUIntToFloat(color1, 0);
-    const XMVECTOR interpolated = XMVectorLerp(color0Float, color1Float, 0.5f);
+    const XMVECTOR horizontalMask = XMVectorReplicateInt(0x11111111u);
 
-    return XMConvertVectorFloatToUInt(XMVectorRound(interpolated), 0);
+    // Sum horizontally adjacent flag bits.
+    const XMVECTOR horizontal = AddInt32(
+        XMVectorAndInt(flags, horizontalMask),
+        XMVectorAndInt(ShiftRight32<2>(flags), 
+        horizontalMask));
+
+    const XMVECTOR verticalMask = XMVectorReplicateInt(0x00FF00FFu);
+
+    // Sum vertically adjacent pairs to complete each 2x2 region.
+    return AddInt32(
+        XMVectorAndInt(horizontal, verticalMask),
+        XMVectorAndInt(ShiftRight32<8>(horizontal),
+        verticalMask));
 }
 
-// Lee: Interpolate (2 * c0 + c1) / 3 in four SIMD lanes.
-inline XMVECTOR InterpolateTwoToOne(FXMVECTOR color0, FXMVECTOR color1) noexcept
+// Build linear hardware palettes for four opaque BC1 blocks.
+template<bool IsSrgb>
+inline LinearPaletteBC1Batch BuildOpaqueLinearPaletteBC1Batch(FXMVECTOR packedColor0, FXMVECTOR packedColor1) noexcept
 {
-    const XMVECTOR color0Float = XMConvertVectorUIntToFloat(color0, 0);
-    const XMVECTOR color1Float = XMConvertVectorUIntToFloat(color1, 0);
-    const XMVECTOR interpolated = XMVectorLerp(color0Float, color1Float, 1.0f / 3.0f);
+    const RGB8Batch color0 = DecodeRGB565Batch(packedColor0);
+    const RGB8Batch color1 = DecodeRGB565Batch(packedColor1);
 
-    return XMConvertVectorFloatToUInt(XMVectorRound(interpolated), 0);
-}
+    RGB8Batch color2{};
+    RGB8Batch color3{};
 
-// Lee: Decode the BC1 palette for four blocks in parallel.
-inline BC1PaletteBatch DecodeBC1PaletteBatch(const BC1BlockBatch &blocks) noexcept
-{
-    BC1PaletteBatch palette{};
+    // Compute the BC1 hardware palette in integer code space.
+    color2.r = DividePaletteSumBy3(AddInt32(ShiftLeft32<1>(color0.r), color1.r));
+    color2.g = DividePaletteSumBy3(AddInt32(ShiftLeft32<1>(color0.g), color1.g));
+    color2.b = DividePaletteSumBy3(AddInt32(ShiftLeft32<1>(color0.b), color1.b));
 
-    // endpoint 0, 1
-    palette.color[0] = DecodeRGB565Batch(blocks.color0);
-    palette.color[1] = DecodeRGB565Batch(blocks.color1);
+    color3.r = DividePaletteSumBy3(AddInt32(color0.r, ShiftLeft32<1>(color1.r)));
+    color3.g = DividePaletteSumBy3(AddInt32(color0.g, ShiftLeft32<1>(color1.g)));
+    color3.b = DividePaletteSumBy3(AddInt32(color0.b, ShiftLeft32<1>(color1.b)));
 
-    const XMVECTOR fourColorMask = GetBC1FourColorMask(blocks.color0, blocks.color1);
+    LinearPaletteBC1Batch palette{};
 
-    // Color 2 depends on the BC1 palette mode.
-    palette.color[2].r = XMVectorSelect(
-        InterpolateOneToOne(palette.color[0].r, palette.color[1].r),
-        InterpolateTwoToOne(palette.color[0].r, palette.color[1].r),
-        fourColorMask);
+    // Convert the completed hardware palette to linear RGB.
+    palette.c0R = ConvertRGB8ToLinearBatch<IsSrgb>(color0.r);
+    palette.c0G = ConvertRGB8ToLinearBatch<IsSrgb>(color0.g);
+    palette.c0B = ConvertRGB8ToLinearBatch<IsSrgb>(color0.b);
 
-    palette.color[2].g = XMVectorSelect(
-        InterpolateOneToOne(palette.color[0].g, palette.color[1].g),
-        InterpolateTwoToOne(palette.color[0].g, palette.color[1].g),
-        fourColorMask);
+    palette.c1R = ConvertRGB8ToLinearBatch<IsSrgb>(color1.r);
+    palette.c1G = ConvertRGB8ToLinearBatch<IsSrgb>(color1.g);
+    palette.c1B = ConvertRGB8ToLinearBatch<IsSrgb>(color1.b);
 
-    palette.color[2].b = XMVectorSelect(
-        InterpolateOneToOne(palette.color[0].b, palette.color[1].b),
-        InterpolateTwoToOne(palette.color[0].b, palette.color[1].b),
-        fourColorMask);
+    palette.c2R = ConvertRGB8ToLinearBatch<IsSrgb>(color2.r);
+    palette.c2G = ConvertRGB8ToLinearBatch<IsSrgb>(color2.g);
+    palette.c2B = ConvertRGB8ToLinearBatch<IsSrgb>(color2.b);
 
-    // Color 3 is transparent black in three-color mode.
-    const XMVECTOR zero = XMVectorZero();
-
-    palette.color[3].r = XMVectorSelect(
-        zero,
-        InterpolateTwoToOne(palette.color[1].r, palette.color[0].r),
-        fourColorMask);
-
-    palette.color[3].g = XMVectorSelect(
-        zero,
-        InterpolateTwoToOne(palette.color[1].g, palette.color[0].g),
-        fourColorMask);
-
-    palette.color[3].b = XMVectorSelect(
-        zero,
-        InterpolateTwoToOne(palette.color[1].b, palette.color[0].b),
-        fourColorMask);
+    palette.c3R = ConvertRGB8ToLinearBatch<IsSrgb>(color3.r);
+    palette.c3G = ConvertRGB8ToLinearBatch<IsSrgb>(color3.g);
+    palette.c3B = ConvertRGB8ToLinearBatch<IsSrgb>(color3.b);
 
     return palette;
 }
 
-// Lee: Decode one texel position from four BC1 blocks in parallel.
-template<uint32_t TexelIndex>
-inline RGB8Batch DecodeBC1TexelBatch(const BC1BlockBatch& blocks, const BC1PaletteBatch& palette) noexcept
+// Lee: Extract 2x2 selector histograms from four BC1 blocks in parallel.
+inline void Extract2x2SelectorHistograms(
+    FXMVECTOR packedSelectors,
+    XMVECTOR& histogram0,
+    XMVECTOR& histogram1,
+    XMVECTOR& histogram2,
+    XMVECTOR& histogram3) noexcept
 {
-    const XMVECTOR selectors = ExtractBC1Selector<TexelIndex>(blocks.selectors);
+    const XMVECTOR lowBitMask = XMVectorReplicateInt(0x55555555u);
 
-    RGB8Batch result{};
+    // Separate the low and high bits of every 2-bit selector.
+    const XMVECTOR lowBits = XMVectorAndInt(packedSelectors, lowBitMask);
+    const XMVECTOR highBits = XMVectorAndInt(ShiftRight32<1>(packedSelectors), lowBitMask);
 
-    result.r = SelectBC1PaletteChannel(
-        selectors,
-        palette.color[0].r,
-        palette.color[1].r,
-        palette.color[2].r,
-        palette.color[3].r);
+    // Build one flag bit for each selector value.
+    const XMVECTOR flags0 = XMVectorAndInt(XMVectorNorInt(lowBits, highBits), lowBitMask);
+    const XMVECTOR flags1 = XMVectorAndCInt(lowBits, highBits);
+    const XMVECTOR flags2 = XMVectorAndCInt(highBits, lowBits);
+    const XMVECTOR flags3 = XMVectorAndInt(lowBits, highBits);
 
-    result.g = SelectBC1PaletteChannel(
-        selectors,
-        palette.color[0].g,
-        palette.color[1].g,
-        palette.color[2].g,
-        palette.color[3].g);
+    histogram0 = Count2x2Regions(flags0);
+    histogram1 = Count2x2Regions(flags1);
+    histogram2 = Count2x2Regions(flags2);
+    histogram3 = Count2x2Regions(flags3);
+}
 
-    result.b = SelectBC1PaletteChannel(
-        selectors,
-        palette.color[0].b,
-        palette.color[1].b,
-        palette.color[2].b,
-        palette.color[3].b);
+// Extract one quadrant count and convert it to a normalized weight.
+template<int BitOffset>
+inline XMVECTOR ExtractQuadrantWeight(FXMVECTOR histogram) noexcept
+{
+    static_assert(BitOffset == 0 || BitOffset == 4 || BitOffset == 16 || BitOffset == 20, "Invalid BC1 quadrant histogram offset");
+
+    const XMVECTOR countMask = XMVectorReplicateInt(0xFu);
+    const XMVECTOR counts = XMVectorAndInt(ShiftRight32<BitOffset>(histogram), countMask);
+
+    return XMVectorScale(XMConvertVectorUIntToFloat(counts, 0), 0.25f);
+}
+
+// Compute one weighted linear RGB quadrant mean.
+inline LinearRGBBatch ComputePaletteMean(
+    const LinearPaletteBC1Batch& palette,
+    FXMVECTOR weight0,
+    FXMVECTOR weight1,
+    FXMVECTOR weight2,
+    GXMVECTOR weight3) noexcept
+{
+    LinearRGBBatch result{};
+
+    result.r = XMVectorMultiply(palette.c0R, weight0);
+    result.r = XMVectorMultiplyAdd(palette.c1R, weight1, result.r);
+    result.r = XMVectorMultiplyAdd(palette.c2R, weight2, result.r);
+    result.r = XMVectorMultiplyAdd(palette.c3R, weight3, result.r);
+
+    result.g = XMVectorMultiply(palette.c0G, weight0);
+    result.g = XMVectorMultiplyAdd(palette.c1G, weight1, result.g);
+    result.g = XMVectorMultiplyAdd(palette.c2G, weight2, result.g);
+    result.g = XMVectorMultiplyAdd(palette.c3G, weight3, result.g);
+
+    result.b = XMVectorMultiply(palette.c0B, weight0);
+    result.b = XMVectorMultiplyAdd(palette.c1B, weight1, result.b);
+    result.b = XMVectorMultiplyAdd(palette.c2B, weight2, result.b);
+    result.b = XMVectorMultiplyAdd(palette.c3B, weight3, result.b);
 
     return result;
 }
 
-// Lee: Average four unsigned 8-bit channel values in each SIMD lane.
-inline XMVECTOR AverageFourUInt8(
+// Compute one quadrant mean from four selector histograms.
+template<int BitOffset>
+inline LinearRGBBatch ComputeQuadrantMean(
+    const LinearPaletteBC1Batch& palette,
+    FXMVECTOR histogram0,
+    FXMVECTOR histogram1,
+    FXMVECTOR histogram2,
+    GXMVECTOR histogram3) noexcept
+{
+    const XMVECTOR weight0 = ExtractQuadrantWeight<BitOffset>(histogram0);
+    const XMVECTOR weight1 = ExtractQuadrantWeight<BitOffset>(histogram1);
+    const XMVECTOR weight2 = ExtractQuadrantWeight<BitOffset>(histogram2);
+    const XMVECTOR weight3 = ExtractQuadrantWeight<BitOffset>(histogram3);
+
+    return ComputePaletteMean(palette, weight0, weight1, weight2, weight3);
+}
+
+// Compute four linear quadrant means for four parent BC1 blocks.
+template<bool IsSrgb>
+inline QuadrantMeansBatch ComputeParentQuadrantMeansBatch(
+    FXMVECTOR packedColor0,
+    FXMVECTOR packedColor1,
+    FXMVECTOR histogram0,
+    GXMVECTOR histogram1,
+    HXMVECTOR histogram2,
+    HXMVECTOR histogram3) noexcept
+{
+    const LinearPaletteBC1Batch palette = BuildOpaqueLinearPaletteBC1Batch<IsSrgb>(packedColor0, packedColor1);
+
+    const LinearRGBBatch q0 = ComputeQuadrantMean<0>(palette, histogram0, histogram1, histogram2, histogram3);
+    const LinearRGBBatch q1 = ComputeQuadrantMean<4>(palette, histogram0, histogram1, histogram2, histogram3);
+    const LinearRGBBatch q2 = ComputeQuadrantMean<16>(palette, histogram0, histogram1, histogram2, histogram3);
+    const LinearRGBBatch q3 = ComputeQuadrantMean<20>(palette, histogram0, histogram1, histogram2, histogram3);
+
+    QuadrantMeansBatch result{};
+
+    result.q0R = q0.r;
+    result.q0G = q0.g;
+    result.q0B = q0.b;
+
+    result.q1R = q1.r;
+    result.q1G = q1.g;
+    result.q1B = q1.b;
+
+    result.q2R = q2.r;
+    result.q2G = q2.g;
+    result.q2B = q2.b;
+
+    result.q3R = q3.r;
+    result.q3G = q3.g;
+    result.q3B = q3.b;
+
+    return result;
+}
+
+// Compute the linear mean of each parent BC1 block.
+inline LinearRGBBatch ComputeBlockMeansBatch(const QuadrantMeansBatch& quadrants) noexcept
+{
+    LinearRGBBatch result{};
+
+    result.r = XMVectorAdd(quadrants.q0R, quadrants.q1R);
+    result.r = XMVectorAdd(result.r, quadrants.q2R);
+    result.r = XMVectorAdd(result.r, quadrants.q3R);
+    result.r = XMVectorScale(result.r, 0.25f);
+
+    result.g = XMVectorAdd(quadrants.q0G, quadrants.q1G);
+    result.g = XMVectorAdd(result.g, quadrants.q2G);
+    result.g = XMVectorAdd(result.g, quadrants.q3G);
+    result.g = XMVectorScale(result.g, 0.25f);
+
+    result.b = XMVectorAdd(quadrants.q0B, quadrants.q1B);
+    result.b = XMVectorAdd(result.b, quadrants.q2B);
+    result.b = XMVectorAdd(result.b, quadrants.q3B);
+    result.b = XMVectorScale(result.b, 0.25f);
+
+    return result;
+}
+
+// Compute mean and within-block covariance for four parent blocks.
+inline ParentStatisticsBatch ComputeParentStatisticsBatch(const QuadrantMeansBatch& parent) noexcept
+{
+    ParentStatisticsBatch result{};
+    result.mean = ComputeBlockMeansBatch(parent);
+
+    const XMVECTOR d0R = XMVectorSubtract(parent.q0R, result.mean.r);
+    const XMVECTOR d0G = XMVectorSubtract(parent.q0G, result.mean.g);
+    const XMVECTOR d0B = XMVectorSubtract(parent.q0B, result.mean.b);
+
+    const XMVECTOR d1R = XMVectorSubtract(parent.q1R, result.mean.r);
+    const XMVECTOR d1G = XMVectorSubtract(parent.q1G, result.mean.g);
+    const XMVECTOR d1B = XMVectorSubtract(parent.q1B, result.mean.b);
+
+    const XMVECTOR d2R = XMVectorSubtract(parent.q2R, result.mean.r);
+    const XMVECTOR d2G = XMVectorSubtract(parent.q2G, result.mean.g);
+    const XMVECTOR d2B = XMVectorSubtract(parent.q2B, result.mean.b);
+
+    const XMVECTOR d3R = XMVectorSubtract(parent.q3R, result.mean.r);
+    const XMVECTOR d3G = XMVectorSubtract(parent.q3G, result.mean.g);
+    const XMVECTOR d3B = XMVectorSubtract(parent.q3B, result.mean.b);
+
+    result.withinCovariance.rr = XMVectorMultiply(d0R, d0R);
+    result.withinCovariance.rr = XMVectorMultiplyAdd(d1R, d1R, result.withinCovariance.rr);
+    result.withinCovariance.rr = XMVectorMultiplyAdd(d2R, d2R, result.withinCovariance.rr);
+    result.withinCovariance.rr = XMVectorMultiplyAdd(d3R, d3R, result.withinCovariance.rr);
+    result.withinCovariance.rr = XMVectorScale(result.withinCovariance.rr, 0.25f);
+
+    result.withinCovariance.gg = XMVectorMultiply(d0G, d0G);
+    result.withinCovariance.gg = XMVectorMultiplyAdd(d1G, d1G, result.withinCovariance.gg);
+    result.withinCovariance.gg = XMVectorMultiplyAdd(d2G, d2G, result.withinCovariance.gg);
+    result.withinCovariance.gg = XMVectorMultiplyAdd(d3G, d3G, result.withinCovariance.gg);
+    result.withinCovariance.gg = XMVectorScale(result.withinCovariance.gg, 0.25f);
+
+    result.withinCovariance.bb = XMVectorMultiply(d0B, d0B);
+    result.withinCovariance.bb = XMVectorMultiplyAdd(d1B, d1B, result.withinCovariance.bb);
+    result.withinCovariance.bb = XMVectorMultiplyAdd(d2B, d2B, result.withinCovariance.bb);
+    result.withinCovariance.bb = XMVectorMultiplyAdd(d3B, d3B, result.withinCovariance.bb);
+    result.withinCovariance.bb = XMVectorScale(result.withinCovariance.bb, 0.25f);
+
+    result.withinCovariance.rg = XMVectorMultiply(d0R, d0G);
+    result.withinCovariance.rg = XMVectorMultiplyAdd(d1R, d1G, result.withinCovariance.rg);
+    result.withinCovariance.rg = XMVectorMultiplyAdd(d2R, d2G, result.withinCovariance.rg);
+    result.withinCovariance.rg = XMVectorMultiplyAdd(d3R, d3G, result.withinCovariance.rg);
+    result.withinCovariance.rg = XMVectorScale(result.withinCovariance.rg, 0.25f);
+
+    result.withinCovariance.rb = XMVectorMultiply(d0R, d0B);
+    result.withinCovariance.rb = XMVectorMultiplyAdd(d1R, d1B, result.withinCovariance.rb);
+    result.withinCovariance.rb = XMVectorMultiplyAdd(d2R, d2B, result.withinCovariance.rb);
+    result.withinCovariance.rb = XMVectorMultiplyAdd(d3R, d3B, result.withinCovariance.rb);
+    result.withinCovariance.rb = XMVectorScale(result.withinCovariance.rb, 0.25f);
+
+    result.withinCovariance.gb = XMVectorMultiply(d0G, d0B);
+    result.withinCovariance.gb = XMVectorMultiplyAdd(d1G, d1B, result.withinCovariance.gb);
+    result.withinCovariance.gb = XMVectorMultiplyAdd(d2G, d2B, result.withinCovariance.gb);
+    result.withinCovariance.gb = XMVectorMultiplyAdd(d3G, d3B, result.withinCovariance.gb);
+    result.withinCovariance.gb = XMVectorScale(result.withinCovariance.gb, 0.25f);
+
+    return result;
+}
+
+// Average four floating-point SIMD vectors.
+inline XMVECTOR MeanFourVectors(
     FXMVECTOR value0,
     FXMVECTOR value1,
     FXMVECTOR value2,
     GXMVECTOR value3) noexcept
 {
-    XMVECTOR sum = AddInt32(value0, value1);
-    sum = AddInt32(sum, value2);
-    sum = AddInt32(sum, value3);
-
-    sum = AddInt32(sum, XMVectorReplicateInt(2u));
-    return ShiftRight32<2>(sum);
+    XMVECTOR result = XMVectorAdd(value0, value1);
+    result = XMVectorAdd(result, value2);
+    result = XMVectorAdd(result, value3);
+    return XMVectorScale(result, 0.25f);
 }
 
-// Lee: Average four RGB texel batches in parallel
-inline RGB8Batch AverageFourRGB8(
-    const RGB8Batch& texel0,
-    const RGB8Batch& texel1,
-    const RGB8Batch& texel2,
-    const RGB8Batch& texel3) noexcept
+// Add the between-parent covariance contribution.
+inline void AccumulateBetweenParentCovariance(
+    const ParentStatisticsBatch& parent,
+    const LinearRGBBatch& mean,
+    CovarianceMatrixBatch& covariance) noexcept
 {
-    RGB8Batch result{};
-    result.r = AverageFourUInt8(texel0.r, texel1.r, texel2.r, texel3.r);
-    result.g = AverageFourUInt8(texel0.g, texel1.g, texel2.g, texel3.g);
-    result.b = AverageFourUInt8(texel0.b, texel1.b, texel2.b, texel3.b);
+    const XMVECTOR deltaR = XMVectorSubtract(parent.mean.r, mean.r);
+    const XMVECTOR deltaG = XMVectorSubtract(parent.mean.g, mean.g);
+    const XMVECTOR deltaB = XMVectorSubtract(parent.mean.b, mean.b);
 
+    covariance.rr = XMVectorMultiplyAdd(deltaR, XMVectorScale(deltaR, 0.25f), covariance.rr);
+    covariance.gg = XMVectorMultiplyAdd(deltaG, XMVectorScale(deltaG, 0.25f), covariance.gg);
+    covariance.bb = XMVectorMultiplyAdd(deltaB, XMVectorScale(deltaB, 0.25f), covariance.bb);
+    covariance.rg = XMVectorMultiplyAdd(deltaR, XMVectorScale(deltaG, 0.25f), covariance.rg);
+    covariance.rb = XMVectorMultiplyAdd(deltaR, XMVectorScale(deltaB, 0.25f), covariance.rb);
+    covariance.gb = XMVectorMultiplyAdd(deltaG, XMVectorScale(deltaB, 0.25f), covariance.gb);
+}
+
+// Combine four parent distributions with the ANOVA covariance identity.
+inline void ComputeChildBlockMoments(
+    const QuadrantMeansBatch& p00,
+    const QuadrantMeansBatch& p10,
+    const QuadrantMeansBatch& p01,
+    const QuadrantMeansBatch& p11,
+    SourceBlockMeansBatch& sourceMeans,
+    LinearRGBBatch& mean,
+    CovarianceMatrixBatch& covariance) noexcept
+{
+    const ParentStatisticsBatch stats00 = ComputeParentStatisticsBatch(p00);
+    const ParentStatisticsBatch stats10 = ComputeParentStatisticsBatch(p10);
+    const ParentStatisticsBatch stats01 = ComputeParentStatisticsBatch(p01);
+    const ParentStatisticsBatch stats11 = ComputeParentStatisticsBatch(p11);
+
+    sourceMeans.p00 = stats00.mean;
+    sourceMeans.p10 = stats10.mean;
+    sourceMeans.p01 = stats01.mean;
+    sourceMeans.p11 = stats11.mean;
+
+    mean.r = MeanFourVectors(stats00.mean.r, stats10.mean.r, stats01.mean.r, stats11.mean.r);
+    mean.g = MeanFourVectors(stats00.mean.g, stats10.mean.g, stats01.mean.g, stats11.mean.g);
+    mean.b = MeanFourVectors(stats00.mean.b, stats10.mean.b, stats01.mean.b, stats11.mean.b);
+
+    CovarianceMatrixBatch within{};
+    within.rr = MeanFourVectors(stats00.withinCovariance.rr, stats10.withinCovariance.rr, stats01.withinCovariance.rr, stats11.withinCovariance.rr);
+    within.gg = MeanFourVectors(stats00.withinCovariance.gg, stats10.withinCovariance.gg, stats01.withinCovariance.gg, stats11.withinCovariance.gg);
+    within.bb = MeanFourVectors(stats00.withinCovariance.bb, stats10.withinCovariance.bb, stats01.withinCovariance.bb, stats11.withinCovariance.bb);
+    within.rg = MeanFourVectors(stats00.withinCovariance.rg, stats10.withinCovariance.rg, stats01.withinCovariance.rg, stats11.withinCovariance.rg);
+    within.rb = MeanFourVectors(stats00.withinCovariance.rb, stats10.withinCovariance.rb, stats01.withinCovariance.rb, stats11.withinCovariance.rb);
+    within.gb = MeanFourVectors(stats00.withinCovariance.gb, stats10.withinCovariance.gb, stats01.withinCovariance.gb, stats11.withinCovariance.gb);
+
+    CovarianceMatrixBatch between{};
+    const XMVECTOR zero = XMVectorZero();
+    between.rr = zero;
+    between.gg = zero;
+    between.bb = zero;
+    between.rg = zero;
+    between.rb = zero;
+    between.gb = zero;
+
+    AccumulateBetweenParentCovariance(stats00, mean, between);
+    AccumulateBetweenParentCovariance(stats10, mean, between);
+    AccumulateBetweenParentCovariance(stats01, mean, between);
+    AccumulateBetweenParentCovariance(stats11, mean, between);
+
+    covariance.rr = XMVectorAdd(between.rr, within.rr);
+    covariance.gg = XMVectorAdd(between.gg, within.gg);
+    covariance.bb = XMVectorAdd(between.bb, within.bb);
+    covariance.rg = XMVectorAdd(between.rg, within.rg);
+    covariance.rb = XMVectorAdd(between.rb, within.rb);
+    covariance.gb = XMVectorAdd(between.gb, within.gb);
+}
+
+// Expand the projection range with one linear RGB sample.
+inline void ExpandProjectionRange(
+    const LinearRGBBatch& color,
+    const ProjectionContextBatch& context,
+    XMVECTOR& minimum,
+    XMVECTOR& maximum) noexcept
+{
+    XMVECTOR projection = XMVectorMultiply(context.axis.r, XMVectorSubtract(color.r, context.mean.r));
+    projection = XMVectorMultiplyAdd(context.axis.g, XMVectorSubtract(color.g, context.mean.g), projection);
+    projection = XMVectorMultiplyAdd(context.axis.b, XMVectorSubtract(color.b, context.mean.b), projection);
+    minimum = XMVectorMin(minimum, projection);
+    maximum = XMVectorMax(maximum, projection);
+}
+
+// Expand the projection range with all four quadrants of one parent.
+inline void ExpandParentProjectionRange(
+    const QuadrantMeansBatch& parent,
+    const ProjectionContextBatch& context,
+    XMVECTOR& minimum,
+    XMVECTOR& maximum) noexcept
+{
+    ExpandProjectionRange({ parent.q0R, parent.q0G, parent.q0B }, context, minimum, maximum);
+    ExpandProjectionRange({ parent.q1R, parent.q1G, parent.q1B }, context, minimum, maximum);
+    ExpandProjectionRange({ parent.q2R, parent.q2G, parent.q2B }, context, minimum, maximum);
+    ExpandProjectionRange({ parent.q3R, parent.q3G, parent.q3B }, context, minimum, maximum);
+}
+
+// Estimate the principal axis and initial endpoint range.
+inline EndpointPairBatch ComputeInitialEndpointsPCA(
+    const CovarianceMatrixBatch& covariance,
+    const LinearRGBBatch& mean,
+    const QuadrantMeansBatch& p00,
+    const QuadrantMeansBatch& p10,
+    const QuadrantMeansBatch& p01,
+    const QuadrantMeansBatch& p11) noexcept
+{
+    LinearRGBBatch axis{};
+    axis.r = XMVectorReplicate(0.57735f);
+    axis.g = XMVectorReplicate(0.57735f);
+    axis.b = XMVectorReplicate(0.57735f);
+
+    LinearRGBBatch next{};
+    next.r = XMVectorMultiply(covariance.rr, axis.r);
+    next.r = XMVectorMultiplyAdd(covariance.rg, axis.g, next.r);
+    next.r = XMVectorMultiplyAdd(covariance.rb, axis.b, next.r);
+
+    next.g = XMVectorMultiply(covariance.rg, axis.r);
+    next.g = XMVectorMultiplyAdd(covariance.gg, axis.g, next.g);
+    next.g = XMVectorMultiplyAdd(covariance.gb, axis.b, next.g);
+
+    next.b = XMVectorMultiply(covariance.rb, axis.r);
+    next.b = XMVectorMultiplyAdd(covariance.gb, axis.g, next.b);
+    next.b = XMVectorMultiplyAdd(covariance.bb, axis.b, next.b);
+
+    XMVECTOR lengthSquared = XMVectorMultiply(next.r, next.r);
+    lengthSquared = XMVectorMultiplyAdd(next.g, next.g, lengthSquared);
+    lengthSquared = XMVectorMultiplyAdd(next.b, next.b, lengthSquared);
+    lengthSquared = XMVectorAdd(lengthSquared, XMVectorReplicate(1e-20f));
+
+    const XMVECTOR inverseLength = XMVectorReciprocalSqrt(lengthSquared);
+    axis.r = XMVectorMultiply(next.r, inverseLength);
+    axis.g = XMVectorMultiply(next.g, inverseLength);
+    axis.b = XMVectorMultiply(next.b, inverseLength);
+
+    const ProjectionContextBatch context{ axis, mean };
+    XMVECTOR minimum = XMVectorReplicate(10000.0f);
+    XMVECTOR maximum = XMVectorReplicate(-10000.0f);
+
+    ExpandParentProjectionRange(p00, context, minimum, maximum);
+    ExpandParentProjectionRange(p10, context, minimum, maximum);
+    ExpandParentProjectionRange(p01, context, minimum, maximum);
+    ExpandParentProjectionRange(p11, context, minimum, maximum);
+
+    EndpointPairBatch result{};
+    result.p0.r = XMVectorMultiplyAdd(axis.r, minimum, mean.r);
+    result.p0.g = XMVectorMultiplyAdd(axis.g, minimum, mean.g);
+    result.p0.b = XMVectorMultiplyAdd(axis.b, minimum, mean.b);
+    result.p1.r = XMVectorMultiplyAdd(axis.r, maximum, mean.r);
+    result.p1.g = XMVectorMultiplyAdd(axis.g, maximum, mean.g);
+    result.p1.b = XMVectorMultiplyAdd(axis.b, maximum, mean.b);
     return result;
 }
 
-// Lee: Downsample one 2x2 texel region from four BC1 blocks in parallel.
-template<uint32_t OutputX, uint32_t OutputY>
-inline RGB8Batch DownsampleBC1TexelBatch(const BC1BlockBatch& blocks, const BC1PaletteBatch& palette) noexcept
+// Accumulate one sample for the fixed-selector least-squares solve.
+inline void AccumulateLeastSquaresSample(
+    const LinearRGBBatch& color,
+    const LeastSquaresContextBatch& context,
+    LeastSquaresAccumulatorBatch& accumulator) noexcept
 {
-    static_assert(OutputX < 2, "OutputX must be 0 or 1");
-    static_assert(OutputY < 2, "OutputY must be 0 or 1");
+    XMVECTOR projection = XMVectorMultiply(XMVectorSubtract(color.r, context.p0.r), context.direction.r);
+    projection = XMVectorMultiplyAdd(XMVectorSubtract(color.g, context.p0.g), context.direction.g, projection);
+    projection = XMVectorMultiplyAdd(XMVectorSubtract(color.b, context.p0.b), context.direction.b, projection);
+    projection = XMVectorMultiply(projection, context.inverseLengthSquared);
 
-    constexpr uint32_t sourceX = OutputX * 2;
-    constexpr uint32_t sourceY = OutputY * 2;
-    constexpr uint32_t topLeft = sourceY * 4 + sourceX;
+    const XMVECTOR zero = XMVectorZero();
+    const XMVECTOR one = XMVectorReplicate(1.0f);
+    XMVECTOR weight = XMVectorClamp(projection, zero, one);
+    weight = XMVectorRound(XMVectorScale(weight, 3.0f));
+    weight = XMVectorScale(weight, 1.0f / 3.0f);
 
-    const RGB8Batch texel0 = DecodeBC1TexelBatch<topLeft>(blocks, palette);
-    const RGB8Batch texel1 = DecodeBC1TexelBatch<topLeft + 1>(blocks, palette);
-    const RGB8Batch texel2 = DecodeBC1TexelBatch<topLeft + 4>(blocks, palette);
-    const RGB8Batch texel3 = DecodeBC1TexelBatch<topLeft + 5>(blocks, palette);
-
-    return AverageFourRGB8(texel0, texel1, texel2, texel3);
+    accumulator.weightSum = XMVectorAdd(accumulator.weightSum, weight);
+    accumulator.weightSquaredSum = XMVectorMultiplyAdd(weight, weight, accumulator.weightSquaredSum);
+    accumulator.weighted.r = XMVectorMultiplyAdd(weight, color.r, accumulator.weighted.r);
+    accumulator.weighted.g = XMVectorMultiplyAdd(weight, color.g, accumulator.weighted.g);
+    accumulator.weighted.b = XMVectorMultiplyAdd(weight, color.b, accumulator.weighted.b);
 }
 
-// Lee: Downsample four source BC1 blocks into one 4x4 output block.
-inline DownsampledBC1Block DownsampleBC1BlockGroup(const BC1BlockBatch& blocks, const BC1PaletteBatch& palette) noexcept
+// Accumulate all four quadrant samples from one parent block.
+inline void AccumulateParentLeastSquares(
+    const QuadrantMeansBatch& parent,
+    const LeastSquaresContextBatch& context,
+    LeastSquaresAccumulatorBatch& accumulator) noexcept
 {
-    DownsampledBC1Block result{};
-    result.texelGroup[0] = DownsampleBC1TexelBatch<0, 0>(blocks, palette);
-    result.texelGroup[1] = DownsampleBC1TexelBatch<1, 0>(blocks, palette);
-    result.texelGroup[2] = DownsampleBC1TexelBatch<0, 1>(blocks, palette);
-    result.texelGroup[3] = DownsampleBC1TexelBatch<1, 1>(blocks, palette);
+    AccumulateLeastSquaresSample({ parent.q0R, parent.q0G, parent.q0B }, context, accumulator);
+    AccumulateLeastSquaresSample({ parent.q1R, parent.q1G, parent.q1B }, context, accumulator);
+    AccumulateLeastSquaresSample({ parent.q2R, parent.q2G, parent.q2B }, context, accumulator);
+    AccumulateLeastSquaresSample({ parent.q3R, parent.q3G, parent.q3B }, context, accumulator);
+}
 
+// Refine the two endpoints while holding four BC1 selector weights fixed.
+inline EndpointPairBatch OptimizeEndpointsLeastSquares(
+    const QuadrantMeansBatch& p00,
+    const QuadrantMeansBatch& p10,
+    const QuadrantMeansBatch& p01,
+    const QuadrantMeansBatch& p11,
+    const LinearRGBBatch& mean,
+    const EndpointPairBatch& endpoints) noexcept
+{
+    LeastSquaresContextBatch context{};
+    context.p0 = endpoints.p0;
+    context.direction.r = XMVectorSubtract(endpoints.p1.r, endpoints.p0.r);
+    context.direction.g = XMVectorSubtract(endpoints.p1.g, endpoints.p0.g);
+    context.direction.b = XMVectorSubtract(endpoints.p1.b, endpoints.p0.b);
+
+    XMVECTOR lengthSquared = XMVectorMultiply(context.direction.r, context.direction.r);
+    lengthSquared = XMVectorMultiplyAdd(context.direction.g, context.direction.g, lengthSquared);
+    lengthSquared = XMVectorMultiplyAdd(context.direction.b, context.direction.b, lengthSquared);
+    lengthSquared = XMVectorAdd(lengthSquared, XMVectorReplicate(1e-12f));
+    context.inverseLengthSquared = XMVectorReciprocal(lengthSquared);
+
+    LeastSquaresAccumulatorBatch accumulator{};
+    const XMVECTOR zero = XMVectorZero();
+    accumulator.weightSum = zero;
+    accumulator.weightSquaredSum = zero;
+    accumulator.weighted.r = zero;
+    accumulator.weighted.g = zero;
+    accumulator.weighted.b = zero;
+
+    AccumulateParentLeastSquares(p00, context, accumulator);
+    AccumulateParentLeastSquares(p10, context, accumulator);
+    AccumulateParentLeastSquares(p01, context, accumulator);
+    AccumulateParentLeastSquares(p11, context, accumulator);
+
+    const XMVECTOR sixteen = XMVectorReplicate(16.0f);
+    XMVECTOR determinant = XMVectorMultiply(sixteen, accumulator.weightSquaredSum);
+    determinant = XMVectorNegativeMultiplySubtract(accumulator.weightSum, accumulator.weightSum, determinant);
+
+    const XMVECTOR singularMask = XMVectorLess(determinant, XMVectorReplicate(1e-6f));
+    const XMVECTOR safeDeterminant = XMVectorSelect(determinant, XMVectorReplicate(1.0f), singularMask);
+    const XMVECTOR inverseDeterminant = XMVectorReciprocal(safeDeterminant);
+
+    const LinearRGBBatch total
+    {
+        XMVectorScale(mean.r, 16.0f),
+        XMVectorScale(mean.g, 16.0f),
+        XMVectorScale(mean.b, 16.0f)
+    };
+
+    EndpointPairBatch result{};
+    LinearRGBBatch direction{};
+
+    result.p0.r = XMVectorMultiply(accumulator.weightSquaredSum, total.r);
+    result.p0.r = XMVectorNegativeMultiplySubtract(accumulator.weightSum, accumulator.weighted.r, result.p0.r);
+    result.p0.r = XMVectorMultiply(result.p0.r, inverseDeterminant);
+
+    result.p0.g = XMVectorMultiply(accumulator.weightSquaredSum, total.g);
+    result.p0.g = XMVectorNegativeMultiplySubtract(accumulator.weightSum, accumulator.weighted.g, result.p0.g);
+    result.p0.g = XMVectorMultiply(result.p0.g, inverseDeterminant);
+
+    result.p0.b = XMVectorMultiply(accumulator.weightSquaredSum, total.b);
+    result.p0.b = XMVectorNegativeMultiplySubtract(accumulator.weightSum, accumulator.weighted.b, result.p0.b);
+    result.p0.b = XMVectorMultiply(result.p0.b, inverseDeterminant);
+
+    direction.r = XMVectorMultiply(sixteen, accumulator.weighted.r);
+    direction.r = XMVectorNegativeMultiplySubtract(accumulator.weightSum, total.r, direction.r);
+    direction.r = XMVectorMultiply(direction.r, inverseDeterminant);
+
+    direction.g = XMVectorMultiply(sixteen, accumulator.weighted.g);
+    direction.g = XMVectorNegativeMultiplySubtract(accumulator.weightSum, total.g, direction.g);
+    direction.g = XMVectorMultiply(direction.g, inverseDeterminant);
+
+    direction.b = XMVectorMultiply(sixteen, accumulator.weighted.b);
+    direction.b = XMVectorNegativeMultiplySubtract(accumulator.weightSum, total.b, direction.b);
+    direction.b = XMVectorMultiply(direction.b, inverseDeterminant);
+
+    result.p1.r = XMVectorAdd(result.p0.r, direction.r);
+    result.p1.g = XMVectorAdd(result.p0.g, direction.g);
+    result.p1.b = XMVectorAdd(result.p0.b, direction.b);
+
+    result.p0.r = XMVectorSelect(result.p0.r, mean.r, singularMask);
+    result.p0.g = XMVectorSelect(result.p0.g, mean.g, singularMask);
+    result.p0.b = XMVectorSelect(result.p0.b, mean.b, singularMask);
+    result.p1.r = XMVectorSelect(result.p1.r, mean.r, singularMask);
+    result.p1.g = XMVectorSelect(result.p1.g, mean.g, singularMask);
+    result.p1.b = XMVectorSelect(result.p1.b, mean.b, singularMask);
     return result;
 }
 
-// Lee: Our main function 
+// Apply the sRGB transfer curve independently to all four SIMD lanes.
+inline XMVECTOR LinearToSrgbBatch(FXMVECTOR linear) noexcept
+{
+    const XMVECTOR zero = XMVectorZero();
+    const XMVECTOR one = XMVectorReplicate(1.0f);
+    const XMVECTOR value = XMVectorClamp(linear, zero, one);
+    const XMVECTOR low = XMVectorScale(value, 12.92f);
+    const XMVECTOR gamma = XMVectorReplicate(1.0f / 2.4f);
+    XMVECTOR high = XMVectorPow(value, gamma);
+    high = XMVectorSubtract(XMVectorScale(high, 1.055f), XMVectorReplicate(0.055f));
+    const XMVECTOR highMask = XMVectorGreater(value, XMVectorReplicate(0.0031308f));
+    return XMVectorSelect(low, high, highMask);
+}
+
+// Apply the inverse sRGB transfer curve independently to all four SIMD lanes.
+inline XMVECTOR SrgbToLinearFloatBatch(FXMVECTOR srgb) noexcept
+{
+    const XMVECTOR zero = XMVectorZero();
+    const XMVECTOR one = XMVectorReplicate(1.0f);
+    const XMVECTOR value = XMVectorClamp(srgb, zero, one);
+    const XMVECTOR low = XMVectorScale(value, 1.0f / 12.92f);
+    XMVECTOR high = XMVectorAdd(value, XMVectorReplicate(0.055f));
+    high = XMVectorScale(high, 1.0f / 1.055f);
+    high = XMVectorPow(high, XMVectorReplicate(2.4f));
+    const XMVECTOR highMask = XMVectorGreater(value, XMVectorReplicate(0.04045f));
+    return XMVectorSelect(low, high, highMask);
+}
+
+// Correct the BC1 chord-curve gap and return endpoint code values.
+template<bool IsSrgb>
+inline EndpointPairBatch CorrectChordCurveGap(const EndpointPairBatch& endpoints) noexcept
+{
+    if (!IsSrgb)
+    {
+        return endpoints;
+    }
+    else
+    {
+        LinearRGBBatch midpoint{};
+        midpoint.r = XMVectorScale(XMVectorAdd(endpoints.p0.r, endpoints.p1.r), 0.5f);
+        midpoint.g = XMVectorScale(XMVectorAdd(endpoints.p0.g, endpoints.p1.g), 0.5f);
+        midpoint.b = XMVectorScale(XMVectorAdd(endpoints.p0.b, endpoints.p1.b), 0.5f);
+
+        LinearRGBBatch s0{};
+        LinearRGBBatch s1{};
+        s0.r = LinearToSrgbBatch(endpoints.p0.r);
+        s0.g = LinearToSrgbBatch(endpoints.p0.g);
+        s0.b = LinearToSrgbBatch(endpoints.p0.b);
+        s1.r = LinearToSrgbBatch(endpoints.p1.r);
+        s1.g = LinearToSrgbBatch(endpoints.p1.g);
+        s1.b = LinearToSrgbBatch(endpoints.p1.b);
+
+        LinearRGBBatch curveMidpoint{};
+        curveMidpoint.r = SrgbToLinearFloatBatch(XMVectorScale(XMVectorAdd(s0.r, s1.r), 0.5f));
+        curveMidpoint.g = SrgbToLinearFloatBatch(XMVectorScale(XMVectorAdd(s0.g, s1.g), 0.5f));
+        curveMidpoint.b = SrgbToLinearFloatBatch(XMVectorScale(XMVectorAdd(s0.b, s1.b), 0.5f));
+
+        const XMVECTOR correctionScale = XMVectorReplicate(4.0f / 9.0f);
+        LinearRGBBatch correction{};
+        correction.r = XMVectorMultiply(XMVectorSubtract(midpoint.r, curveMidpoint.r), correctionScale);
+        correction.g = XMVectorMultiply(XMVectorSubtract(midpoint.g, curveMidpoint.g), correctionScale);
+        correction.b = XMVectorMultiply(XMVectorSubtract(midpoint.b, curveMidpoint.b), correctionScale);
+
+        EndpointPairBatch result{};
+        result.p0.r = LinearToSrgbBatch(XMVectorAdd(endpoints.p0.r, correction.r));
+        result.p0.g = LinearToSrgbBatch(XMVectorAdd(endpoints.p0.g, correction.g));
+        result.p0.b = LinearToSrgbBatch(XMVectorAdd(endpoints.p0.b, correction.b));
+        result.p1.r = LinearToSrgbBatch(XMVectorAdd(endpoints.p1.r, correction.r));
+        result.p1.g = LinearToSrgbBatch(XMVectorAdd(endpoints.p1.g, correction.g));
+        result.p1.b = LinearToSrgbBatch(XMVectorAdd(endpoints.p1.b, correction.b));
+        return result;
+    }
+}
+
+// Return the closest BC1 hardware palette selector in each SIMD lane.
+inline XMVECTOR FindBestSelector(
+    FXMVECTOR distance0,
+    FXMVECTOR distance1,
+    FXMVECTOR distance2,
+    GXMVECTOR distance3) noexcept
+{
+    const XMVECTOR select1 = XMVectorLess(distance1, distance0);
+    const XMVECTOR select3 = XMVectorLess(distance3, distance2);
+    const XMVECTOR index01 = XMVectorSelect(XMVectorReplicateInt(0u), XMVectorReplicateInt(1u), select1);
+    const XMVECTOR index23 = XMVectorSelect(XMVectorReplicateInt(2u), XMVectorReplicateInt(3u), select3);
+    const XMVECTOR minimum01 = XMVectorMin(distance0, distance1);
+    const XMVECTOR minimum23 = XMVectorMin(distance2, distance3);
+    return XMVectorSelect(index01, index23, XMVectorLess(minimum23, minimum01));
+}
+
+// Compute squared RGB distance to one palette color.
+inline XMVECTOR ComputeColorDistance(
+    const LinearRGBBatch& color,
+    FXMVECTOR paletteR,
+    FXMVECTOR paletteG,
+    FXMVECTOR paletteB) noexcept
+{
+    const XMVECTOR deltaR = XMVectorSubtract(color.r, paletteR);
+    const XMVECTOR deltaG = XMVectorSubtract(color.g, paletteG);
+    const XMVECTOR deltaB = XMVectorSubtract(color.b, paletteB);
+    XMVECTOR distance = XMVectorMultiply(deltaR, deltaR);
+    distance = XMVectorMultiplyAdd(deltaG, deltaG, distance);
+    distance = XMVectorMultiplyAdd(deltaB, deltaB, distance);
+    return distance;
+}
+
+// Assign one output texel selector for four blocks in parallel.
+template<int TexelIndex>
+inline void AssignNearestSelector(
+    const LinearRGBBatch& color,
+    const LinearPaletteBC1Batch& palette,
+    XMVECTOR& packedSelectors) noexcept
+{
+    static_assert(TexelIndex >= 0 && TexelIndex < 16, "Invalid BC1 texel index");
+    const XMVECTOR distance0 = ComputeColorDistance(color, palette.c0R, palette.c0G, palette.c0B);
+    const XMVECTOR distance1 = ComputeColorDistance(color, palette.c1R, palette.c1G, palette.c1B);
+    const XMVECTOR distance2 = ComputeColorDistance(color, palette.c2R, palette.c2G, palette.c2B);
+    const XMVECTOR distance3 = ComputeColorDistance(color, palette.c3R, palette.c3G, palette.c3B);
+    const XMVECTOR selector = FindBestSelector(distance0, distance1, distance2, distance3);
+    packedSelectors = XMVectorOrInt(packedSelectors, ShiftLeft32<TexelIndex * 2>(selector));
+}
+
+// Quantize four normalized endpoint components to an unsigned integer range.
+inline XMVECTOR QuantizeUNormBatch(FXMVECTOR values, float maximum) noexcept
+{
+    const XMVECTOR clamped = XMVectorClamp(values, XMVectorZero(), XMVectorReplicate(1.0f));
+    const XMVECTOR rounded = XMVectorRound(XMVectorScale(clamped, maximum));
+    return XMConvertVectorFloatToUInt(rounded, 0);
+}
+
+// Guarantee opaque BC1 endpoint ordering in all four lanes.
+inline void EnforceOpaqueEndpointOrder(XMVECTOR& packed0, XMVECTOR& packed1) noexcept
+{
+    const XMVECTOR equalMask = XMVectorEqualInt(packed0, packed1);
+    const XMVECTOR blue = XMVectorAndInt(packed1, XMVectorReplicateInt(0x1Fu));
+    const XMVECTOR canDecreaseMask = GreaterInt32(blue, XMVectorZero());
+    const XMVECTOR decreaseMask = XMVectorAndInt(equalMask, canDecreaseMask);
+    const XMVECTOR increaseMask = XMVectorAndCInt(equalMask, canDecreaseMask);
+
+    packed1 = XMVectorSelect(packed1, SubtractInt32(packed1, XMVectorReplicateInt(1u)), decreaseMask);
+    packed0 = XMVectorSelect(packed0, AddInt32(packed0, XMVectorReplicateInt(1u)), increaseMask);
+
+    const XMVECTOR swapMask = GreaterInt32(packed1, packed0);
+    const XMVECTOR original0 = packed0;
+    packed0 = XMVectorSelect(packed0, packed1, swapMask);
+    packed1 = XMVectorSelect(packed1, original0, swapMask);
+}
+
+// Quantize endpoints and assign the sixteen destination selectors.
+template<bool IsSrgb>
+inline BC1BlockBatch PackAndReallocateSelectors(
+    const EndpointPairBatch& endpoints,
+    const QuadrantMeansBatch& p00,
+    const QuadrantMeansBatch& p10,
+    const QuadrantMeansBatch& p01,
+    const QuadrantMeansBatch& p11) noexcept
+{
+    const XMVECTOR r0 = QuantizeUNormBatch(endpoints.p0.r, 31.0f);
+    const XMVECTOR g0 = QuantizeUNormBatch(endpoints.p0.g, 63.0f);
+    const XMVECTOR b0 = QuantizeUNormBatch(endpoints.p0.b, 31.0f);
+    const XMVECTOR r1 = QuantizeUNormBatch(endpoints.p1.r, 31.0f);
+    const XMVECTOR g1 = QuantizeUNormBatch(endpoints.p1.g, 63.0f);
+    const XMVECTOR b1 = QuantizeUNormBatch(endpoints.p1.b, 31.0f);
+
+    BC1BlockBatch result{};
+    result.color0 = XMVectorOrInt(XMVectorOrInt(ShiftLeft32<11>(r0), ShiftLeft32<5>(g0)), b0);
+    result.color1 = XMVectorOrInt(XMVectorOrInt(ShiftLeft32<11>(r1), ShiftLeft32<5>(g1)), b1);
+    EnforceOpaqueEndpointOrder(result.color0, result.color1);
+
+    const LinearPaletteBC1Batch palette = BuildOpaqueLinearPaletteBC1Batch<IsSrgb>(result.color0, result.color1);
+    result.selectors = XMVectorZero();
+
+    AssignNearestSelector<0>({ p00.q0R, p00.q0G, p00.q0B }, palette, result.selectors);
+    AssignNearestSelector<1>({ p00.q1R, p00.q1G, p00.q1B }, palette, result.selectors);
+    AssignNearestSelector<4>({ p00.q2R, p00.q2G, p00.q2B }, palette, result.selectors);
+    AssignNearestSelector<5>({ p00.q3R, p00.q3G, p00.q3B }, palette, result.selectors);
+
+    AssignNearestSelector<2>({ p10.q0R, p10.q0G, p10.q0B }, palette, result.selectors);
+    AssignNearestSelector<3>({ p10.q1R, p10.q1G, p10.q1B }, palette, result.selectors);
+    AssignNearestSelector<6>({ p10.q2R, p10.q2G, p10.q2B }, palette, result.selectors);
+    AssignNearestSelector<7>({ p10.q3R, p10.q3G, p10.q3B }, palette, result.selectors);
+
+    AssignNearestSelector<8>({ p01.q0R, p01.q0G, p01.q0B }, palette, result.selectors);
+    AssignNearestSelector<9>({ p01.q1R, p01.q1G, p01.q1B }, palette, result.selectors);
+    AssignNearestSelector<12>({ p01.q2R, p01.q2G, p01.q2B }, palette, result.selectors);
+    AssignNearestSelector<13>({ p01.q3R, p01.q3G, p01.q3B }, palette, result.selectors);
+
+    AssignNearestSelector<10>({ p11.q0R, p11.q0G, p11.q0B }, palette, result.selectors);
+    AssignNearestSelector<11>({ p11.q1R, p11.q1G, p11.q1B }, palette, result.selectors);
+    AssignNearestSelector<14>({ p11.q2R, p11.q2G, p11.q2B }, palette, result.selectors);
+    AssignNearestSelector<15>({ p11.q3R, p11.q3G, p11.q3B }, palette, result.selectors);
+    return result;
+}
+
+// Encode four 4x4 linear RGB sample groups into four BC1 blocks.
+template<bool IsSrgb>
+inline BC1BlockBatch EncodeLinearBlocksBC1Batch(
+    const QuadrantMeansBatch& p00,
+    const QuadrantMeansBatch& p10,
+    const QuadrantMeansBatch& p01,
+    const QuadrantMeansBatch& p11,
+    SourceBlockMeansBatch& sourceMeans) noexcept
+{
+    LinearRGBBatch mean{};
+    CovarianceMatrixBatch covariance{};
+    ComputeChildBlockMoments(p00, p10, p01, p11, sourceMeans, mean, covariance);
+    const EndpointPairBatch initial = ComputeInitialEndpointsPCA(covariance, mean, p00, p10, p01, p11);
+    const EndpointPairBatch optimized = OptimizeEndpointsLeastSquares(p00, p10, p01, p11, mean, initial);
+    const EndpointPairBatch corrected = CorrectChordCurveGap<IsSrgb>(optimized);
+    return PackAndReallocateSelectors<IsSrgb>(corrected, p00, p10, p01, p11);
+}
+
+// Generate four destination blocks directly from sixteen compressed parents.
+template<bool IsSrgb>
+inline BC1BlockBatch EncodeMipBlocksBC1Batch(
+    const BC1BlockBatch& p00,
+    const BC1BlockBatch& p10,
+    const BC1BlockBatch& p01,
+    const BC1BlockBatch& p11,
+    SourceBlockMeansBatch& sourceMeans) noexcept
+{
+    XMVECTOR p00Hist0, p00Hist1, p00Hist2, p00Hist3;
+    XMVECTOR p10Hist0, p10Hist1, p10Hist2, p10Hist3;
+    XMVECTOR p01Hist0, p01Hist1, p01Hist2, p01Hist3;
+    XMVECTOR p11Hist0, p11Hist1, p11Hist2, p11Hist3;
+
+    Extract2x2SelectorHistograms(p00.selectors, p00Hist0, p00Hist1, p00Hist2, p00Hist3);
+    Extract2x2SelectorHistograms(p10.selectors, p10Hist0, p10Hist1, p10Hist2, p10Hist3);
+    Extract2x2SelectorHistograms(p01.selectors, p01Hist0, p01Hist1, p01Hist2, p01Hist3);
+    Extract2x2SelectorHistograms(p11.selectors, p11Hist0, p11Hist1, p11Hist2, p11Hist3);
+
+    const QuadrantMeansBatch p00Means = ComputeParentQuadrantMeansBatch<IsSrgb>(p00.color0, p00.color1, p00Hist0, p00Hist1, p00Hist2, p00Hist3);
+    const QuadrantMeansBatch p10Means = ComputeParentQuadrantMeansBatch<IsSrgb>(p10.color0, p10.color1, p10Hist0, p10Hist1, p10Hist2, p10Hist3);
+    const QuadrantMeansBatch p01Means = ComputeParentQuadrantMeansBatch<IsSrgb>(p01.color0, p01.color1, p01Hist0, p01Hist1, p01Hist2, p01Hist3);
+    const QuadrantMeansBatch p11Means = ComputeParentQuadrantMeansBatch<IsSrgb>(p11.color0, p11.color1, p11Hist0, p11Hist1, p11Hist2, p11Hist3);
+    return EncodeLinearBlocksBC1Batch<IsSrgb>(p00Means, p10Means, p01Means, p11Means, sourceMeans);
+}
+
+// Store valid SIMD lanes as ordinary BC1 blocks.
+inline void StoreBC1BlockBatch(const BC1BlockBatch& batch, D3DX_BC1* blocks, size_t validLanes) noexcept
+{
+    XMUINT4 color0{};
+    XMUINT4 color1{};
+    XMUINT4 selectors{};
+    XMStoreUInt4(&color0, batch.color0);
+    XMStoreUInt4(&color1, batch.color1);
+    XMStoreUInt4(&selectors, batch.selectors);
+
+    const uint32_t packedColor0[4] = { color0.x, color0.y, color0.z, color0.w };
+    const uint32_t packedColor1[4] = { color1.x, color1.y, color1.z, color1.w };
+    const uint32_t packedSelectors[4] = { selectors.x, selectors.y, selectors.z, selectors.w };
+
+    for (size_t lane = 0; lane < validLanes; ++lane)
+    {
+        blocks[lane].rgb[0] = static_cast<uint16_t>(packedColor0[lane]);
+        blocks[lane].rgb[1] = static_cast<uint16_t>(packedColor1[lane]);
+        blocks[lane].bitmap = packedSelectors[lane];
+    }
+}
+
+// Store one source-block mean from a SIMD lane.
+inline void StoreBlockMean(const LinearRGBBatch& means, size_t lane, LinearBlockMean& destination) noexcept
+{
+    destination.r = XMVectorGetByIndex(means.r, lane);
+    destination.g = XMVectorGetByIndex(means.g, lane);
+    destination.b = XMVectorGetByIndex(means.b, lane);
+}
+
+// Reject BC1 blocks that use transparent three-color mode.
+inline bool IsOpaqueBC1Image(const Image& image) noexcept
+{
+    const size_t blockWidth = std::max<size_t>(1, (image.width + 3) / 4);
+    const size_t blockHeight = std::max<size_t>(1, (image.height + 3) / 4);
+
+    for (size_t y = 0; y < blockHeight; ++y)
+    {
+        const auto* row = reinterpret_cast<const D3DX_BC1*>(image.pixels + y * image.rowPitch);
+        for (size_t x = 0; x < blockWidth; ++x)
+        {
+            if (row[x].rgb[0] < row[x].rgb[1])
+            {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+// Process one mip-1 block row directly from compressed parent blocks.
+template<bool IsSrgb>
+inline void ProcessCompressedRowBC1(
+    const Image& source,
+    Image& destination,
+    size_t destinationRow,
+    LinearBlockMean* sourceBlockMeans) noexcept
+{
+    constexpr size_t laneCount = 4;
+    const size_t sourceBlockWidth = std::max<size_t>(1, (source.width + 3) / 4);
+    const size_t sourceBlockHeight = std::max<size_t>(1, (source.height + 3) / 4);
+    const size_t destinationBlockWidth = std::max<size_t>(1, (destination.width + 3) / 4);
+    const size_t sourceY0 = std::min(destinationRow * 2, sourceBlockHeight - 1);
+    const size_t sourceY1 = std::min(sourceY0 + 1, sourceBlockHeight - 1);
+    const auto* sourceRow0 = reinterpret_cast<const D3DX_BC1*>(source.pixels + sourceY0 * source.rowPitch);
+    const auto* sourceRow1 = reinterpret_cast<const D3DX_BC1*>(source.pixels + sourceY1 * source.rowPitch);
+    auto* destinationBlocks = reinterpret_cast<D3DX_BC1*>(destination.pixels + destinationRow * destination.rowPitch);
+
+    for (size_t destinationX = 0; destinationX < destinationBlockWidth; destinationX += laneCount)
+    {
+        D3DX_BC1 p00Blocks[laneCount]{};
+        D3DX_BC1 p10Blocks[laneCount]{};
+        D3DX_BC1 p01Blocks[laneCount]{};
+        D3DX_BC1 p11Blocks[laneCount]{};
+        const size_t validLanes = std::min(laneCount, destinationBlockWidth - destinationX);
+
+        for (size_t lane = 0; lane < laneCount; ++lane)
+        {
+            const size_t childX = destinationX + std::min(lane, validLanes - 1);
+            const size_t sourceX0 = std::min(childX * 2, sourceBlockWidth - 1);
+            const size_t sourceX1 = std::min(sourceX0 + 1, sourceBlockWidth - 1);
+            p00Blocks[lane] = sourceRow0[sourceX0];
+            p10Blocks[lane] = sourceRow0[sourceX1];
+            p01Blocks[lane] = sourceRow1[sourceX0];
+            p11Blocks[lane] = sourceRow1[sourceX1];
+        }
+
+        SourceBlockMeansBatch means{};
+        const BC1BlockBatch encoded = EncodeMipBlocksBC1Batch<IsSrgb>(
+            LoadBC1BlockBatch(p00Blocks),
+            LoadBC1BlockBatch(p10Blocks),
+            LoadBC1BlockBatch(p01Blocks),
+            LoadBC1BlockBatch(p11Blocks),
+            means);
+        StoreBC1BlockBatch(encoded, destinationBlocks + destinationX, validLanes);
+
+        if (sourceBlockMeans)
+        {
+            for (size_t lane = 0; lane < validLanes; ++lane)
+            {
+                const size_t childX = destinationX + lane;
+                const size_t sourceX0 = std::min(childX * 2, sourceBlockWidth - 1);
+                const size_t sourceX1 = std::min(sourceX0 + 1, sourceBlockWidth - 1);
+                StoreBlockMean(means.p00, lane, sourceBlockMeans[sourceY0 * sourceBlockWidth + sourceX0]);
+
+                if (sourceX1 != sourceX0)
+                {
+                    StoreBlockMean(means.p10, lane, sourceBlockMeans[sourceY0 * sourceBlockWidth + sourceX1]);
+                }
+
+                if (sourceY1 != sourceY0)
+                {
+                    StoreBlockMean(means.p01, lane, sourceBlockMeans[sourceY1 * sourceBlockWidth + sourceX0]);
+                    if (sourceX1 != sourceX0)
+                    {
+                        StoreBlockMean(means.p11, lane, sourceBlockMeans[sourceY1 * sourceBlockWidth + sourceX1]);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Halve one row of the linear block-mean image with edge clamping.
+inline void DownsampleLinearMeanRow(
+    const LinearBlockMean* source,
+    size_t sourceWidth,
+    size_t sourceHeight,
+    LinearBlockMean* destination,
+    size_t destinationWidth,
+    size_t destinationRow) noexcept
+{
+    const size_t sourceY0 = std::min(destinationRow * 2, sourceHeight - 1);
+    const size_t sourceY1 = std::min(sourceY0 + 1, sourceHeight - 1);
+
+    for (size_t destinationX = 0; destinationX < destinationWidth; ++destinationX)
+    {
+        const size_t sourceX0 = std::min(destinationX * 2, sourceWidth - 1);
+        const size_t sourceX1 = std::min(sourceX0 + 1, sourceWidth - 1);
+        const LinearBlockMean& s00 = source[sourceY0 * sourceWidth + sourceX0];
+        const LinearBlockMean& s10 = source[sourceY0 * sourceWidth + sourceX1];
+        const LinearBlockMean& s01 = source[sourceY1 * sourceWidth + sourceX0];
+        const LinearBlockMean& s11 = source[sourceY1 * sourceWidth + sourceX1];
+        LinearBlockMean& output = destination[destinationRow * destinationWidth + destinationX];
+        output.r = (s00.r + s10.r + s01.r + s11.r) * 0.25f;
+        output.g = (s00.g + s10.g + s01.g + s11.g) * 0.25f;
+        output.b = (s00.b + s10.b + s01.b + s11.b) * 0.25f;
+    }
+}
+
+// Insert one scalar mean into one lane of a quadrant sample.
+inline void SetQuadrantSample(
+    QuadrantMeansBatch& quadrants,
+    size_t sample,
+    size_t lane,
+    const LinearBlockMean& color) noexcept
+{
+    XMVECTOR* red[] = { &quadrants.q0R, &quadrants.q1R, &quadrants.q2R, &quadrants.q3R };
+    XMVECTOR* green[] = { &quadrants.q0G, &quadrants.q1G, &quadrants.q2G, &quadrants.q3G };
+    XMVECTOR* blue[] = { &quadrants.q0B, &quadrants.q1B, &quadrants.q2B, &quadrants.q3B };
+    *red[sample] = XMVectorSetByIndex(*red[sample], color.r, lane);
+    *green[sample] = XMVectorSetByIndex(*green[sample], color.g, lane);
+    *blue[sample] = XMVectorSetByIndex(*blue[sample], color.b, lane);
+}
+
+// Fetch one mean texel with clamp-to-edge addressing.
+inline const LinearBlockMean& FetchLinearMean(
+    const LinearBlockMean* source,
+    size_t width,
+    size_t height,
+    size_t x,
+    size_t y) noexcept
+{
+    return source[std::min(y, height - 1) * width + std::min(x, width - 1)];
+}
+
+// Encode one destination row from the linear block-mean image.
+template<bool IsSrgb>
+inline void ProcessLinearRowBC1(
+    const LinearBlockMean* source,
+    size_t sourceWidth,
+    size_t sourceHeight,
+    Image& destination,
+    size_t destinationRow) noexcept
+{
+    constexpr size_t laneCount = 4;
+    const size_t destinationBlockWidth = std::max<size_t>(1, (destination.width + 3) / 4);
+    auto* destinationBlocks = reinterpret_cast<D3DX_BC1*>(destination.pixels + destinationRow * destination.rowPitch);
+
+    for (size_t destinationX = 0; destinationX < destinationBlockWidth; destinationX += laneCount)
+    {
+        QuadrantMeansBatch regions[4]{};
+        const size_t validLanes = std::min(laneCount, destinationBlockWidth - destinationX);
+
+        for (size_t lane = 0; lane < validLanes; ++lane)
+        {
+            const size_t blockX = destinationX + lane;
+            const size_t texelBaseX = blockX * 4;
+            const size_t texelBaseY = destinationRow * 4;
+
+            for (size_t localY = 0; localY < 4; ++localY)
+            {
+                for (size_t localX = 0; localX < 4; ++localX)
+                {
+                    const size_t region = ((localY >> 1) << 1) + (localX >> 1);
+                    const size_t sample = ((localY & 1) << 1) + (localX & 1);
+                    const LinearBlockMean& color = FetchLinearMean(source, sourceWidth, sourceHeight, texelBaseX + localX, texelBaseY + localY);
+                    SetQuadrantSample(regions[region], sample, lane, color);
+                }
+            }
+        }
+
+        SourceBlockMeansBatch unusedMeans{};
+        const BC1BlockBatch encoded = EncodeLinearBlocksBC1Batch<IsSrgb>(regions[0], regions[1], regions[2], regions[3], unusedMeans);
+        StoreBC1BlockBatch(encoded, destinationBlocks + destinationX, validLanes);
+    }
+}
+
+// Generate all compressed mip levels after level zero.
+template<bool IsSrgb>
+HRESULT GenerateCompressedMipMapsBC1(const Image& baseImage, ScratchImage& mipChain) noexcept
+{
+    const size_t mipLevels = mipChain.GetMetadata().mipLevels;
+    if (mipLevels <= 1)
+    {
+        return S_OK;
+    }
+
+    if (IsSrgb)
+    {
+        (void)GetSrgb8ToLinearTable();
+    }
+
+    const size_t baseBlockWidth = std::max<size_t>(1, (baseImage.width + 3) / 4);
+    const size_t baseBlockHeight = std::max<size_t>(1, (baseImage.height + 3) / 4);
+    std::unique_ptr<LinearBlockMean[]> meanImage;
+    std::unique_ptr<LinearBlockMean[]> meanScratch;
+
+    if (mipLevels > 2)
+    {
+        const size_t meanCount = baseBlockWidth * baseBlockHeight;
+        const size_t scratchWidth = (baseBlockWidth + 1) / 2;
+        const size_t scratchHeight = (baseBlockHeight + 1) / 2;
+        meanImage.reset(new (std::nothrow) LinearBlockMean[meanCount]);
+        meanScratch.reset(new (std::nothrow) LinearBlockMean[scratchWidth * scratchHeight]);
+        if (!meanImage || !meanScratch)
+        {
+            return E_OUTOFMEMORY;
+        }
+    }
+
+    LinearBlockMean* meanFront = meanImage.get();
+    LinearBlockMean* meanBack = meanScratch.get();
+    size_t meanWidth = baseBlockWidth;
+    size_t meanHeight = baseBlockHeight;
+
+    for (size_t mipLevel = 1; mipLevel < mipLevels; ++mipLevel)
+    {
+        Image* destination = const_cast<Image*>(mipChain.GetImage(mipLevel, 0, 0));
+        if (!destination || !destination->pixels)
+        {
+            return E_FAIL;
+        }
+
+        const size_t destinationBlockHeight = std::max<size_t>(1, (destination->height + 3) / 4);
+
+        if (mipLevel >= 3)
+        {
+            const size_t nextWidth = (meanWidth + 1) / 2;
+            const size_t nextHeight = (meanHeight + 1) / 2;
+
+        #ifdef _OPENMP
+            #pragma omp parallel for
+        #endif
+            for (ptrdiff_t row = 0; row < static_cast<ptrdiff_t>(nextHeight); ++row)
+            {
+                DownsampleLinearMeanRow(meanFront, meanWidth, meanHeight, meanBack, nextWidth, static_cast<size_t>(row));
+            }
+
+            std::swap(meanFront, meanBack);
+            meanWidth = nextWidth;
+            meanHeight = nextHeight;
+        }
+
+    #ifdef _OPENMP
+        #pragma omp parallel for
+    #endif
+        for (ptrdiff_t row = 0; row < static_cast<ptrdiff_t>(destinationBlockHeight); ++row)
+        {
+            if (mipLevel == 1)
+            {
+                ProcessCompressedRowBC1<IsSrgb>(baseImage, *destination, static_cast<size_t>(row), meanFront);
+            }
+            else
+            {
+                ProcessLinearRowBC1<IsSrgb>(meanFront, meanWidth, meanHeight, *destination, static_cast<size_t>(row));
+            }
+        }
+    }
+
+    return S_OK;
+}
+
+// Generate an opaque BC1 mip chain without materializing uncompressed images.
 HRESULT DirectX::GenerateCompressedMipMaps(const Image& baseImage, size_t levels, ScratchImage& mipChain) noexcept
 {
     if (!baseImage.pixels)
@@ -304,30 +1394,34 @@ HRESULT DirectX::GenerateCompressedMipMaps(const Image& baseImage, size_t levels
         return HRESULT_E_NOT_SUPPORTED;
     }
 
-    // Lee: allocate the compressed output mip chain
+    if (!IsOpaqueBC1Image(baseImage))
+    {
+        return HRESULT_E_NOT_SUPPORTED;
+    }
+
+    // Allocate the compressed output mip chain.
     HRESULT hr = mipChain.Initialize2D(baseImage.format, baseImage.width, baseImage.height, 1, levels);
     if (FAILED(hr))
     {
         return hr;
     }
 
-    // Lee: Get hte base level of the output mip chain.
+    // Copy the original compressed level zero into the output chain.
     const Image* outputBase = mipChain.GetImage(0, 0, 0);
     if (!outputBase || !outputBase->pixels)
     {
         return E_POINTER;
     }
 
-    // Lee: The source and destination BC1 layout must match.
+    // The source and destination BC1 layouts must match.
     if (baseImage.rowPitch != outputBase->rowPitch || baseImage.slicePitch != outputBase->slicePitch)
     {
         return E_FAIL;
     }
 
-    // Lee: Copy data 
     memcpy_s(outputBase->pixels, outputBase->slicePitch, baseImage.pixels, baseImage.slicePitch);
 
-
-
-    return E_NOTIMPL;
+    return IsSRGB(baseImage.format)
+        ? GenerateCompressedMipMapsBC1<true>(baseImage, mipChain)
+        : GenerateCompressedMipMapsBC1<false>(baseImage, mipChain);
 }
