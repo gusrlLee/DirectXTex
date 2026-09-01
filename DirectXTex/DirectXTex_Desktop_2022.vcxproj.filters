@@ -98,6 +98,9 @@
     <ClCompile Include="DirectXTexCompressedMips.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="DirectXTexCompressedMipsGPU.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <CLInclude Include="BC.h">
@@ -112,6 +115,9 @@
       <Filter>Source Files\Shaders</Filter>
     </None>
     <None Include="Shaders\BC7Encode.hlsl">
+      <Filter>Source Files\Shaders</Filter>
+    </None>
+    <None Include="Shaders\BC1CompressedMips.hlsl">
       <Filter>Source Files\Shaders</Filter>
     </None>
   </ItemGroup>

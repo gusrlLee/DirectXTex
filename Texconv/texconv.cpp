@@ -3737,7 +3737,26 @@ int __cdecl wmain(_In_ int argc, _In_z_count_(argc) wchar_t* argv[])
                         assert(compressedBase);
 
                         ScratchImage domainMipChain;
-                        hr = GenerateCompressedMipMaps(*compressedBase, tMips, domainMipChain);
+                        bool usedGpu = false;
+                        // Use the experimental DirectCompute path only when an adapter is selected explicitly.
+                        if (adapter >= 0 && !(dwOptions & (UINT64_C(1) << OPT_NOGPU)))
+                        {
+                            if (!pDevice)
+                            {
+                                CreateDevice(adapter, pDevice.GetAddressOf());
+                            }
+
+                            if (pDevice)
+                            {
+                                hr = GenerateCompressedMipMaps(pDevice.Get(), *compressedBase, tMips, domainMipChain);
+                                usedGpu = SUCCEEDED(hr);
+                            }
+                        }
+
+                        if (!usedGpu)
+                        {
+                            hr = GenerateCompressedMipMaps(*compressedBase, tMips, domainMipChain);
+                        }
                         if (FAILED(hr)) 
                         {
                             wprintf(L"\nFAILED [compression-domain-mips] (%08X%ls)\n", static_cast<unsigned int>(hr), GetErrorDesc(hr));
@@ -3745,6 +3764,7 @@ int __cdecl wmain(_In_ int argc, _In_z_count_(argc) wchar_t* argv[])
                             continue;
                         }
 
+                        wprintf(usedGpu ? L" [GPU]" : L" [CPU]");
                         *timage = std::move(domainMipChain);
                         info.mipLevels = timage->GetMetadata().mipLevels;
                     }

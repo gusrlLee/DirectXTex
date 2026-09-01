@@ -307,6 +307,7 @@
     <ClCompile Include="BCDirectCompute.cpp" />
     <ClCompile Include="DirectXTexCompress.cpp" />
     <ClCompile Include="DirectXTexCompressedMips.cpp" />
+    <ClCompile Include="DirectXTexCompressedMipsGPU.cpp" />
     <ClCompile Include="DirectXTexCompressGPU.cpp" />
     <ClCompile Include="DirectXTexConvert.cpp" />
     <ClCompile Include="DirectXTexD3D11.cpp" />
@@ -337,6 +338,7 @@
     <None Include="Shaders\BC7Encode.hlsl">
       <FileType>Document</FileType>
     </None>
+    <None Include="Shaders\BC1CompressedMips.hlsl" />
   </ItemGroup>
   <ItemGroup>
     <None Include="Shaders\CompileShaders.cmd" />

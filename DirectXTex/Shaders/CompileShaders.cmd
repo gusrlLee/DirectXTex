@@ -40,6 +40,10 @@ call :CompileShader BC6HEncode TryModeG10CS
 call :CompileShader BC6HEncode TryModeLE10CS
 call :CompileShader BC6HEncode EncodeBlockCS
 
+call :CompileShader5 BC1CompressedMips GenerateMip1CS
+call :CompileShader5 BC1CompressedMips GenerateMipFromMeansCS
+call :CompileShader5 BC1CompressedMips DownsampleMeansCS
+
 echo.
 
 if %error% == 0 (
@@ -60,6 +64,13 @@ echo %fxc%
 %fxc% || set error=1
 echo %fxc4%
 %fxc4% || set error=1
+exit /b
+
+:CompileShader5
+set fxc=%PCFXC% "%1.hlsl" %FXCOPTS% /Tcs_5_0 /E%2 "/Fh%CompileShadersOutput%\%1_%2.inc" "/Fd%CompileShadersOutput%\%1_%2.pdb" /Vn%1_%2
+echo.
+echo %fxc%
+%fxc% || set error=1
 exit /b
 
 :needfxc

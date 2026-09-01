@@ -166,9 +166,11 @@ elseif((BUILD_XBOX_EXTS_XBOXONE OR BUILD_XBOX_EXTS_SCARLETT) AND WIN32)
 endif()
 
 if(BUILD_DX11 AND WIN32 AND (NOT (XBOX_CONSOLE_TARGET STREQUAL "durango")))
+    list(APPEND LIBRARY_SOURCES DirectXTex/DirectXTexCompressedMipsGPU.cpp)
     set(SHADER_SOURCES
         DirectXTex/Shaders/BC6HEncode.hlsl
-        DirectXTex/Shaders/BC7Encode.hlsl)
+        DirectXTex/Shaders/BC7Encode.hlsl
+        DirectXTex/Shaders/BC1CompressedMips.hlsl)
 
     list(APPEND LIBRARY_SOURCES
         DirectXTex/BCDirectCompute.h

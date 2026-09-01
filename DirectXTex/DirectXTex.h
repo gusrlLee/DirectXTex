@@ -852,6 +852,15 @@ namespace DirectX
         _Out_ ScratchImage& mipChain) noexcept;
         // Lee: Our main method function
 
+#if defined(__d3d11_h__) || defined(__d3d11_x_h__)
+    DIRECTX_TEX_API HRESULT __cdecl GenerateCompressedMipMaps(
+        _In_ ID3D11Device* pDevice,
+        _In_ const Image& baseImage,
+        _In_ size_t levels,
+        _Out_ ScratchImage& mipChain) noexcept;
+        // DirectCompute implementation for opaque BC1 textures
+#endif
+
     DIRECTX_TEX_API HRESULT __cdecl GenerateMipMaps3D(
         _In_reads_(depth) const Image* baseImages, _In_ size_t depth, _In_ TEX_FILTER_FLAGS filter, _In_ size_t levels,
         _Out_ ScratchImage& mipChain) noexcept;
