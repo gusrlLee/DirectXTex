@@ -1,4 +1,4 @@
-#include "DirectXTexP.h"
+﻿#include "DirectXTexP.h"
 #include "BC.h"
 
 // Standard containers and allocation helpers used by the mean-image pyramid.
@@ -894,66 +894,24 @@ inline XMVECTOR LinearToSrgbBatch(FXMVECTOR linear) noexcept
     return XMVectorSelect(low, high, highMask);
 }
 
-// Apply the inverse sRGB transfer curve independently to all four SIMD lanes.
-inline XMVECTOR SrgbToLinearFloatBatch(FXMVECTOR srgb) noexcept
-{
-    const XMVECTOR zero = XMVectorZero();
-    const XMVECTOR one = XMVectorReplicate(1.0f);
-    const XMVECTOR value = XMVectorClamp(srgb, zero, one);
-    const XMVECTOR low = XMVectorScale(value, 1.0f / 12.92f);
-    XMVECTOR high = XMVectorAdd(value, XMVectorReplicate(0.055f));
-    high = XMVectorScale(high, 1.0f / 1.055f);
-    high = XMVectorPow(high, XMVectorReplicate(2.4f));
-    const XMVECTOR highMask = XMVectorGreater(value, XMVectorReplicate(0.04045f));
-    return XMVectorSelect(low, high, highMask);
-}
-
-// Correct the BC1 chord-curve gap and return endpoint code values.
+// Convert linear endpoints into the code space that BC1 actually stores.
 template<bool IsSrgb>
-inline EndpointPairBatch CorrectChordCurveGap(const EndpointPairBatch& endpoints) noexcept
+inline EndpointPairBatch ConvertEndpointsToCodeSpace(const EndpointPairBatch& endpoints) noexcept
 {
-    // Linear UNORM palettes do not have a transfer-curve mismatch to correct.
+    // A UNORM palette stores linear code values, so the endpoints are already there.
     if (!IsSrgb)
     {
         return endpoints;
     }
     else
     {
-        // Find the desired midpoint of the endpoint chord in linear-light RGB.
-        LinearRGBBatch midpoint{};
-        midpoint.r = XMVectorScale(XMVectorAdd(endpoints.p0.r, endpoints.p1.r), 0.5f);
-        midpoint.g = XMVectorScale(XMVectorAdd(endpoints.p0.g, endpoints.p1.g), 0.5f);
-        midpoint.b = XMVectorScale(XMVectorAdd(endpoints.p0.b, endpoints.p1.b), 0.5f);
-
-        // Move both endpoints to sRGB code space, where BC1 performs interpolation.
-        LinearRGBBatch s0{};
-        LinearRGBBatch s1{};
-        s0.r = LinearToSrgbBatch(endpoints.p0.r);
-        s0.g = LinearToSrgbBatch(endpoints.p0.g);
-        s0.b = LinearToSrgbBatch(endpoints.p0.b);
-        s1.r = LinearToSrgbBatch(endpoints.p1.r);
-        s1.g = LinearToSrgbBatch(endpoints.p1.g);
-        s1.b = LinearToSrgbBatch(endpoints.p1.b);
-
-        // Reconstruct the midpoint that hardware interpolation would actually produce.
-        LinearRGBBatch curveMidpoint{};
-        curveMidpoint.r = SrgbToLinearFloatBatch(XMVectorScale(XMVectorAdd(s0.r, s1.r), 0.5f));
-        curveMidpoint.g = SrgbToLinearFloatBatch(XMVectorScale(XMVectorAdd(s0.g, s1.g), 0.5f));
-        curveMidpoint.b = SrgbToLinearFloatBatch(XMVectorScale(XMVectorAdd(s0.b, s1.b), 0.5f));
-
-        const XMVECTOR correctionScale = XMVectorReplicate(4.0f / 9.0f);
-        LinearRGBBatch correction{};
-        correction.r = XMVectorMultiply(XMVectorSubtract(midpoint.r, curveMidpoint.r), correctionScale);
-        correction.g = XMVectorMultiply(XMVectorSubtract(midpoint.g, curveMidpoint.g), correctionScale);
-        correction.b = XMVectorMultiply(XMVectorSubtract(midpoint.b, curveMidpoint.b), correctionScale);
-
         EndpointPairBatch result{};
-        result.p0.r = LinearToSrgbBatch(XMVectorAdd(endpoints.p0.r, correction.r));
-        result.p0.g = LinearToSrgbBatch(XMVectorAdd(endpoints.p0.g, correction.g));
-        result.p0.b = LinearToSrgbBatch(XMVectorAdd(endpoints.p0.b, correction.b));
-        result.p1.r = LinearToSrgbBatch(XMVectorAdd(endpoints.p1.r, correction.r));
-        result.p1.g = LinearToSrgbBatch(XMVectorAdd(endpoints.p1.g, correction.g));
-        result.p1.b = LinearToSrgbBatch(XMVectorAdd(endpoints.p1.b, correction.b));
+        result.p0.r = LinearToSrgbBatch(endpoints.p0.r);
+        result.p0.g = LinearToSrgbBatch(endpoints.p0.g);
+        result.p0.b = LinearToSrgbBatch(endpoints.p0.b);
+        result.p1.r = LinearToSrgbBatch(endpoints.p1.r);
+        result.p1.g = LinearToSrgbBatch(endpoints.p1.g);
+        result.p1.b = LinearToSrgbBatch(endpoints.p1.b);
         return result;
     }
 }
@@ -1097,8 +1055,8 @@ inline BC1BlockBatch EncodeLinearBlocksBC1Batch(
     ComputeChildBlockMoments(p00, p10, p01, p11, sourceMeans, mean, covariance);
     const EndpointPairBatch initial = ComputeInitialEndpointsPCA(covariance, mean, p00, p10, p01, p11);
     const EndpointPairBatch optimized = OptimizeEndpointsLeastSquares(p00, p10, p01, p11, mean, initial);
-    const EndpointPairBatch corrected = CorrectChordCurveGap<IsSrgb>(optimized);
-    return PackAndReallocateSelectors<IsSrgb>(corrected, p00, p10, p01, p11);
+    const EndpointPairBatch encoded = ConvertEndpointsToCodeSpace<IsSrgb>(optimized);
+    return PackAndReallocateSelectors<IsSrgb>(encoded, p00, p10, p01, p11);
 }
 
 // Generate four destination blocks directly from sixteen compressed parents.
@@ -1168,7 +1126,10 @@ inline bool IsOpaqueBC1Image(const Image& image) noexcept
         for (size_t x = 0; x < blockWidth; ++x)
         {
             // color0 < color1 selects BC1's transparent three-color mode.
-            if (row[x].rgb[0] < row[x].rgb[1])
+            // Equal endpoints are opaque as long as no texel selects palette entry 3.
+            const uint32_t selector3Bits = row[x].bitmap & (row[x].bitmap >> 1) & 0x55555555u;
+            if (row[x].rgb[0] < row[x].rgb[1]
+                || (row[x].rgb[0] == row[x].rgb[1] && selector3Bits != 0))
             {
                 return false;
             }
@@ -1191,6 +1152,7 @@ inline void ProcessCompressedRowBC1(
     const size_t sourceBlockWidth = std::max<size_t>(1, (source.width + 3) / 4);
     const size_t sourceBlockHeight = std::max<size_t>(1, (source.height + 3) / 4);
     const size_t destinationBlockWidth = std::max<size_t>(1, (destination.width + 3) / 4);
+
     // One destination block covers a 2x2 group of compressed source blocks.
     const size_t sourceY0 = std::min(destinationRow * 2, sourceBlockHeight - 1);
     const size_t sourceY1 = std::min(sourceY0 + 1, sourceBlockHeight - 1);
@@ -1264,19 +1226,23 @@ inline void DownsampleLinearMeanRow(
     size_t destinationRow) noexcept
 {
     // Select two source rows and repeat the final row when the height is odd.
-    const size_t sourceY0 = std::min(destinationRow * 2, sourceHeight - 1);
+    const size_t sourceY0 = destinationRow * 2;
     const size_t sourceY1 = std::min(sourceY0 + 1, sourceHeight - 1);
+    const auto* sourceRow0 = source + sourceY0 * sourceWidth;
+    const auto* sourceRow1 = source + sourceY1 * sourceWidth;
+    auto* destinationRowPtr = destination + destinationRow * destinationWidth;
 
     for (size_t destinationX = 0; destinationX < destinationWidth; ++destinationX)
     {
-        // Average one clamp-to-edge 2x2 footprint in linear RGB.
-        const size_t sourceX0 = std::min(destinationX * 2, sourceWidth - 1);
+        const size_t sourceX0 = destinationX * 2;
         const size_t sourceX1 = std::min(sourceX0 + 1, sourceWidth - 1);
-        const LinearBlockMean& s00 = source[sourceY0 * sourceWidth + sourceX0];
-        const LinearBlockMean& s10 = source[sourceY0 * sourceWidth + sourceX1];
-        const LinearBlockMean& s01 = source[sourceY1 * sourceWidth + sourceX0];
-        const LinearBlockMean& s11 = source[sourceY1 * sourceWidth + sourceX1];
-        LinearBlockMean& output = destination[destinationRow * destinationWidth + destinationX];
+
+        const auto& s00 = sourceRow0[sourceX0];
+        const auto& s10 = sourceRow0[sourceX1];
+        const auto& s01 = sourceRow1[sourceX0];
+        const auto& s11 = sourceRow1[sourceX1];
+
+        auto& output = destinationRowPtr[destinationX];
         output.r = (s00.r + s10.r + s01.r + s11.r) * 0.25f;
         output.g = (s00.g + s10.g + s01.g + s11.g) * 0.25f;
         output.b = (s00.b + s10.b + s01.b + s11.b) * 0.25f;
@@ -1357,7 +1323,7 @@ inline void ProcessLinearRowBC1(
 template<bool IsSrgb>
 HRESULT GenerateCompressedMipMapsBC1(const Image& baseImage, ScratchImage& mipChain) noexcept
 {
-    // Level zero is already present, so a one-level chain requires no generation work.
+    // Level 0 is already present, so a one-level chain requires no generation work.
     const size_t mipLevels = mipChain.GetMetadata().mipLevels;
     if (mipLevels <= 1)
     {
@@ -1381,8 +1347,8 @@ HRESULT GenerateCompressedMipMapsBC1(const Image& baseImage, ScratchImage& mipCh
         const size_t meanCount = baseBlockWidth * baseBlockHeight;
         const size_t scratchWidth = (baseBlockWidth + 1) / 2;
         const size_t scratchHeight = (baseBlockHeight + 1) / 2;
-        meanImage.reset(new (std::nothrow) LinearBlockMean[meanCount]);
-        meanScratch.reset(new (std::nothrow) LinearBlockMean[scratchWidth * scratchHeight]);
+        meanImage.reset(new (std::nothrow) LinearBlockMean[meanCount]{});
+        meanScratch.reset(new (std::nothrow) LinearBlockMean[scratchWidth * scratchHeight]{});
         if (!meanImage || !meanScratch)
         {
             return E_OUTOFMEMORY;

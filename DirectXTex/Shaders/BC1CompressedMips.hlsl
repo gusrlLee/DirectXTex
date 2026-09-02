@@ -212,18 +212,13 @@ uint2 EncodeSamples(float3 samples[16])
         endpoint1 = endpoint0 + direction;
     }
 
-    // BC1 hardware interpolates sRGB endpoints in code space. Shift both endpoints
-    // so the decoded curved midpoint better matches the desired linear midpoint.
+    // Endpoints were fitted in linear light, but BC1 stores code values, so move
+    // them onto the transfer curve before quantization. A UNORM palette already
+    // holds linear code values and needs no conversion.
     if (IsSrgb != 0u)
     {
-        const float3 midpoint = (endpoint0 + endpoint1) * 0.5f;
-        const float3 s0 = float3(LinearToSrgb(endpoint0.r), LinearToSrgb(endpoint0.g), LinearToSrgb(endpoint0.b));
-        const float3 s1 = float3(LinearToSrgb(endpoint1.r), LinearToSrgb(endpoint1.g), LinearToSrgb(endpoint1.b));
-        const float3 sm = (s0 + s1) * 0.5f;
-        const float3 curveMidpoint = float3(SrgbToLinear(sm.r), SrgbToLinear(sm.g), SrgbToLinear(sm.b));
-        const float3 correction = (midpoint - curveMidpoint) * (4.0f / 9.0f);
-        endpoint0 = float3(LinearToSrgb(endpoint0.r + correction.r), LinearToSrgb(endpoint0.g + correction.g), LinearToSrgb(endpoint0.b + correction.b));
-        endpoint1 = float3(LinearToSrgb(endpoint1.r + correction.r), LinearToSrgb(endpoint1.g + correction.g), LinearToSrgb(endpoint1.b + correction.b));
+        endpoint0 = float3(LinearToSrgb(endpoint0.r), LinearToSrgb(endpoint0.g), LinearToSrgb(endpoint0.b));
+        endpoint1 = float3(LinearToSrgb(endpoint1.r), LinearToSrgb(endpoint1.g), LinearToSrgb(endpoint1.b));
     }
 
     // Quantize the optimized endpoint pair into the actual stored BC1 representation.

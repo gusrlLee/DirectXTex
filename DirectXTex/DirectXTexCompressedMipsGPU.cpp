@@ -253,7 +253,11 @@ namespace
             const auto* row = reinterpret_cast<const BC1RawBlock*>(image.pixels + y * image.rowPitch);
             for (size_t x = 0; x < width; ++x)
             {
-                if ((row[x].endpoints & 0xffffu) < (row[x].endpoints >> 16))
+                const uint32_t endpoint0 = row[x].endpoints & 0xffffu;
+                const uint32_t endpoint1 = row[x].endpoints >> 16;
+                const uint32_t selector3Bits = row[x].selectors & (row[x].selectors >> 1) & 0x55555555u;
+                if (endpoint0 < endpoint1
+                    || (endpoint0 == endpoint1 && selector3Bits != 0))
                     return false;
             }
         }
