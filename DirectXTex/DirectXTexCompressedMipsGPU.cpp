@@ -171,9 +171,7 @@ namespace
         ComPtr<ID3D11UnorderedAccessView>* uav,
         uint32_t& capacity) noexcept
     {
-        if (capacity >= requiredCount)
-            return S_OK;
-
+        // Force buffer recreation by always proceeding.
         HRESULT hr = CreateStructuredBuffer(device, stride, requiredCount, nullptr, buffer, srv, uav);
         if (SUCCEEDED(hr))
             capacity = requiredCount;
@@ -182,9 +180,7 @@ namespace
 
     HRESULT EnsureOutputBuffers(ID3D11Device* device, uint32_t requiredCount, GpuMipCache& cache) noexcept
     {
-        if (cache.outputCapacity >= requiredCount)
-            return S_OK;
-
+        // Force buffer recreation by always proceeding.
         ComPtr<ID3D11Buffer> outputBuffer;
         ComPtr<ID3D11UnorderedAccessView> outputUAV;
         HRESULT hr = CreateStructuredBuffer(device, sizeof(BC1RawBlock), requiredCount, nullptr,
@@ -256,8 +252,7 @@ namespace
                 const uint32_t endpoint0 = row[x].endpoints & 0xffffu;
                 const uint32_t endpoint1 = row[x].endpoints >> 16;
                 const uint32_t selector3Bits = row[x].selectors & (row[x].selectors >> 1) & 0x55555555u;
-                if (endpoint0 < endpoint1
-                    || (endpoint0 == endpoint1 && selector3Bits != 0))
+                if (endpoint0 <= endpoint1 && selector3Bits != 0)
                     return false;
             }
         }
@@ -360,12 +355,8 @@ HRESULT DirectX::GenerateCompressedMipMaps(
         if (FAILED(hr)) return hr;
     }
 
-    // Upload only the active part of a grow-only input buffer.
-    D3D11_BOX uploadBox{};
-    uploadBox.right = static_cast<uint32_t>(uint64_t(baseCount) * sizeof(BC1RawBlock));
-    uploadBox.bottom = 1;
-    uploadBox.back = 1;
-    cache.context->UpdateSubresource(cache.baseBuffer.Get(), 0, &uploadBox, baseBlocks.data(), 0, 0);
+    // Since we now force buffer recreation, we can update the entire buffer at once.
+    cache.context->UpdateSubresource(cache.baseBuffer.Get(), 0, nullptr, baseBlocks.data(), 0, 0);
 
     size_t meanFront = 0;
     size_t meanBack = 1;

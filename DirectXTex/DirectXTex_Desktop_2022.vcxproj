@@ -1,4 +1,4 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="utf-8"?>
 <Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup Label="ProjectConfigurations">
     <ProjectConfiguration Include="Debug|Win32">
@@ -353,7 +353,7 @@
       <_ATGFXCVer>$([System.Text.RegularExpressions.Regex]::Match($(_ATGFXCPath), '10\.0\.\d+\.0'))</_ATGFXCVer>
       <_ATGFXCVer Condition="'$(_ATGFXCVer)' != '' and !HasTrailingSlash('$(_ATGFXCVer)')">$(_ATGFXCVer)\</_ATGFXCVer>
     </PropertyGroup>
-    <Exec Condition="!Exists('Shaders/Compiled/BC6HEncode_EncodeBlockCS.inc') or !Exists('Shaders/Compiled/BC1CompressedMips_GenerateMip1CS.inc')" WorkingDirectory="$(ProjectDir)Shaders" Command="CompileShaders" EnvironmentVariables="WindowsSdkVerBinPath=$(_ATGFXCPath);WindowsSDKVersion=$(_ATGFXCVer);CompileShadersOutput=$(ProjectDir)Shaders/Compiled" LogStandardErrorAsError="true" />
+    <Exec Condition="!Exists('Shaders/Compiled/BC6HEncode_EncodeBlockCS.inc') or !Exists('Shaders/Compiled/BC1CompressedMips_GenerateMip1CS.inc')" WorkingDirectory="$(ProjectDir)Shaders" Command="call CompileShaders.cmd" EnvironmentVariables="WindowsSdkVerBinPath=$(_ATGFXCPath);WindowsSDKVersion=$(_ATGFXCVer);CompileShadersOutput=$(ProjectDir)Shaders/Compiled" LogStandardErrorAsError="true" />
     <PropertyGroup>
       <_ATGFXCPath />
       <_ATGFXCVer />

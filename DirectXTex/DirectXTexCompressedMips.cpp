@@ -321,14 +321,26 @@ inline LinearPaletteBC1Batch BuildOpaqueLinearPaletteBC1Batch(FXMVECTOR packedCo
     RGB8Batch color2{};
     RGB8Batch color3{};
 
-    // Reproduce the exact opaque BC1 palette equations in integer code space.
-    color2.r = DividePaletteSumBy3(AddInt32(ShiftLeft32<1>(color0.r), color1.r));
-    color2.g = DividePaletteSumBy3(AddInt32(ShiftLeft32<1>(color0.g), color1.g));
-    color2.b = DividePaletteSumBy3(AddInt32(ShiftLeft32<1>(color0.b), color1.b));
+    const XMVECTOR is4Color = GreaterInt32(packedColor0, packedColor1);
 
-    color3.r = DividePaletteSumBy3(AddInt32(color0.r, ShiftLeft32<1>(color1.r)));
-    color3.g = DividePaletteSumBy3(AddInt32(color0.g, ShiftLeft32<1>(color1.g)));
-    color3.b = DividePaletteSumBy3(AddInt32(color0.b, ShiftLeft32<1>(color1.b)));
+    const XMVECTOR c4_2r = DividePaletteSumBy3(AddInt32(ShiftLeft32<1>(color0.r), color1.r));
+    const XMVECTOR c4_2g = DividePaletteSumBy3(AddInt32(ShiftLeft32<1>(color0.g), color1.g));
+    const XMVECTOR c4_2b = DividePaletteSumBy3(AddInt32(ShiftLeft32<1>(color0.b), color1.b));
+    const XMVECTOR c4_3r = DividePaletteSumBy3(AddInt32(color0.r, ShiftLeft32<1>(color1.r)));
+    const XMVECTOR c4_3g = DividePaletteSumBy3(AddInt32(color0.g, ShiftLeft32<1>(color1.g)));
+    const XMVECTOR c4_3b = DividePaletteSumBy3(AddInt32(color0.b, ShiftLeft32<1>(color1.b)));
+
+    const XMVECTOR c3_2r = ShiftRight32<1>(AddInt32(color0.r, color1.r));
+    const XMVECTOR c3_2g = ShiftRight32<1>(AddInt32(color0.g, color1.g));
+    const XMVECTOR c3_2b = ShiftRight32<1>(AddInt32(color0.b, color1.b));
+
+    color2.r = XMVectorSelect(c3_2r, c4_2r, is4Color);
+    color2.g = XMVectorSelect(c3_2g, c4_2g, is4Color);
+    color2.b = XMVectorSelect(c3_2b, c4_2b, is4Color);
+
+    color3.r = XMVectorSelect(XMVectorZero(), c4_3r, is4Color);
+    color3.g = XMVectorSelect(XMVectorZero(), c4_3g, is4Color);
+    color3.b = XMVectorSelect(XMVectorZero(), c4_3b, is4Color);
 
     LinearPaletteBC1Batch palette{};
 
@@ -1128,8 +1140,7 @@ inline bool IsOpaqueBC1Image(const Image& image) noexcept
             // color0 < color1 selects BC1's transparent three-color mode.
             // Equal endpoints are opaque as long as no texel selects palette entry 3.
             const uint32_t selector3Bits = row[x].bitmap & (row[x].bitmap >> 1) & 0x55555555u;
-            if (row[x].rgb[0] < row[x].rgb[1]
-                || (row[x].rgb[0] == row[x].rgb[1] && selector3Bits != 0))
+            if (row[x].rgb[0] <= row[x].rgb[1] && selector3Bits != 0)
             {
                 return false;
             }

@@ -71,9 +71,20 @@ void BuildPalette(uint2 block, out float3 palette[4])
     const uint3 raw1 = uint3((color1 >> 11) & 31u, (color1 >> 5) & 63u, color1 & 31u);
     const uint3 c0 = uint3((raw0.r << 3) | (raw0.r >> 2), (raw0.g << 2) | (raw0.g >> 4), (raw0.b << 3) | (raw0.b >> 2));
     const uint3 c1 = uint3((raw1.r << 3) | (raw1.r >> 2), (raw1.g << 2) | (raw1.g >> 4), (raw1.b << 3) | (raw1.b >> 2));
+    
     // Opaque BC1 defines palette entries 2 and 3 as integer-weighted thirds.
-    const uint3 c2 = (2u * c0 + c1) / 3u;
-    const uint3 c3 = (c0 + 2u * c1) / 3u;
+    // Added 3-color mode fallback for endpoints where c0 <= c1
+    const bool is4Color = color0 > color1;
+    
+    const uint3 c4_2 = (2u * c0 + c1) / 3u;
+    const uint3 c4_3 = (c0 + 2u * c1) / 3u;
+    
+    const uint3 c3_2 = (c0 + c1) / 2u;
+    const uint3 c3_3 = uint3(0u, 0u, 0u);
+    
+    const uint mask = is4Color ? 0xffffffffu : 0u; const uint3 c2 = (c4_2 & mask) | (c3_2 & ~mask);
+    const uint3 c3 = (c4_3 & mask) | (c3_3 & ~mask);
+    
     float3 p0 = float3(c0) / 255.0f;
     float3 p1 = float3(c1) / 255.0f;
     float3 p2 = float3(c2) / 255.0f;
