@@ -2020,12 +2020,23 @@ int __cdecl wmain(_In_ int argc, _In_z_count_(argc) wchar_t* argv[])
     LARGE_INTEGER qpcStart = {};
     std::ignore = QueryPerformanceCounter(&qpcStart);
 
+    // Cumulative timing counters for pure compute benchmark (excluding disk I/O)
+    LONGLONG totalDecodeTicks = 0;
+    LONGLONG totalDownsampleTicks = 0;
+    LONGLONG totalEncodeTicks = 0;
+    LONGLONG totalOurMipsTicks = 0;
+    size_t processedImageCount = 0;
+
     // Convert images
     bool sizewarn = false;
     bool nonpow2warn = false;
     bool non4bc = false;
     bool preserveAlphaCoverage = false;
     ComPtr<ID3D11Device> pDevice;
+    if (adapter >= 0 && !(dwOptions & (UINT64_C(1) << OPT_NOGPU)))
+    {
+        CreateDevice(adapter, pDevice.GetAddressOf());
+    }
 
     int retVal = 0;
 
@@ -2033,6 +2044,11 @@ int __cdecl wmain(_In_ int argc, _In_z_count_(argc) wchar_t* argv[])
     {
         if (pConv != conversion.begin())
             wprintf(L"\n");
+
+        LONGLONG imgDecodeTicks = 0;
+        LONGLONG imgDownsampleTicks = 0;
+        LONGLONG imgEncodeTicks = 0;
+        LONGLONG imgOurMipsTicks = 0;
 
         // --- Load source image -------------------------------------------------------
         wprintf(L"reading %ls", pConv->szSrc.c_str());
@@ -2450,7 +2466,23 @@ int __cdecl wmain(_In_ int argc, _In_z_count_(argc) wchar_t* argv[])
                 break;
             }
 
+            LARGE_INTEGER tDecodeStart = {};
+            if (dwOptions & (UINT64_C(1) << OPT_TIMING))
+            {
+                std::ignore = QueryPerformanceCounter(&tDecodeStart);
+            }
+
             hr = Decompress(img, nimg, info, formatDecompress, *timage);
+
+            if (dwOptions & (UINT64_C(1) << OPT_TIMING))
+            {
+                LARGE_INTEGER tDecodeEnd = {};
+                std::ignore = QueryPerformanceCounter(&tDecodeEnd);
+                const LONGLONG dt = tDecodeEnd.QuadPart - tDecodeStart.QuadPart;
+                imgDecodeTicks += dt;
+                totalDecodeTicks += dt;
+            }
+
             if (FAILED(hr))
             {
                 wprintf(L" FAILED [decompress] (%08X%ls)\n", static_cast<unsigned int>(hr), GetErrorDesc(hr));
@@ -3312,10 +3344,6 @@ int __cdecl wmain(_In_ int argc, _In_z_count_(argc) wchar_t* argv[])
         // --- Generate mips -----------------------------------------------------------
         // Lee: Check our method request 
         const bool useCompressionDomainMips = (dwOptions & (UINT64_C(1) << OPT_COMPRESSION_DOMAIN_MIPS)) != 0;
-        if (useCompressionDomainMips)
-        {
-            wprintf(L"\n[Compression Domain Mips] enabled\n");
-        }
 
         TEX_FILTER_FLAGS dwFilter3D = dwFilter;
         if (!ispow2(info.width) || !ispow2(info.height) || !ispow2(info.depth))
@@ -3436,6 +3464,12 @@ int __cdecl wmain(_In_ int argc, _In_z_count_(argc) wchar_t* argv[])
                 return 1;
             }
 
+            LARGE_INTEGER tDownsampleStart = {};
+            if (dwOptions & (UINT64_C(1) << OPT_TIMING))
+            {
+                std::ignore = QueryPerformanceCounter(&tDownsampleStart);
+            }
+
             if (info.dimension == TEX_DIMENSION_TEXTURE3D)
             {
                 hr = GenerateMipMaps3D(image->GetImages(), image->GetImageCount(), image->GetMetadata(), dwFilter3D | dwFilterOpts, tMips, *timage);
@@ -3443,6 +3477,15 @@ int __cdecl wmain(_In_ int argc, _In_z_count_(argc) wchar_t* argv[])
             else
             {
                 hr = GenerateMipMaps(image->GetImages(), image->GetImageCount(), image->GetMetadata(), dwFilter | dwFilterOpts, tMips, *timage);
+            }
+
+            if (dwOptions & (UINT64_C(1) << OPT_TIMING))
+            {
+                LARGE_INTEGER tDownsampleEnd = {};
+                std::ignore = QueryPerformanceCounter(&tDownsampleEnd);
+                const LONGLONG dt = tDownsampleEnd.QuadPart - tDownsampleStart.QuadPart;
+                imgDownsampleTicks += dt;
+                totalDownsampleTicks += dt;
             }
             if (FAILED(hr))
             {
@@ -3664,18 +3707,22 @@ int __cdecl wmain(_In_ int argc, _In_z_count_(argc) wchar_t* argv[])
 
                         ScratchImage domainMipChain;
                         bool usedGpu = false;
-                        LARGE_INTEGER mipGenerationStart = {};
-                        if (dwOptions & (UINT64_C(1) << OPT_TIMING))
-                        {
-                            std::ignore = QueryPerformanceCounter(&mipGenerationStart);
-                        }
                         if (adapter >= 0 && !(dwOptions & (UINT64_C(1) << OPT_NOGPU)))
                         {
                             if (!pDevice)
                             {
                                 CreateDevice(adapter, pDevice.GetAddressOf());
                             }
+                        }
 
+                        LARGE_INTEGER mipGenerationStart = {};
+                        if (dwOptions & (UINT64_C(1) << OPT_TIMING))
+                        {
+                            std::ignore = QueryPerformanceCounter(&mipGenerationStart);
+                        }
+
+                        if (adapter >= 0 && !(dwOptions & (UINT64_C(1) << OPT_NOGPU)))
+                        {
                             if (pDevice)
                             {
                                 hr = GenerateCompressedMipMaps(pDevice.Get(), *compressedBase, tMips, domainMipChain);
@@ -3695,14 +3742,13 @@ int __cdecl wmain(_In_ int argc, _In_z_count_(argc) wchar_t* argv[])
                             continue;
                         }
 
-                        wprintf(usedGpu ? L" [GPU]" : L" [CPU]");
                         if (dwOptions & (UINT64_C(1) << OPT_TIMING))
                         {
                             LARGE_INTEGER mipGenerationEnd = {};
                             std::ignore = QueryPerformanceCounter(&mipGenerationEnd);
                             const LONGLONG mipDelta = mipGenerationEnd.QuadPart - mipGenerationStart.QuadPart;
-                            wprintf(L" [mip generation: %.6f seconds]",
-                                double(mipDelta) / double(qpcFreq.QuadPart));
+                            imgOurMipsTicks += mipDelta;
+                            totalOurMipsTicks += mipDelta;
                         }
                         *image = std::move(domainMipChain);
                         info.mipLevels = image->GetMetadata().mipLevels;
@@ -3771,6 +3817,12 @@ int __cdecl wmain(_In_ int argc, _In_z_count_(argc) wchar_t* argv[])
                         non4bc = true;
                     }
 
+                    LARGE_INTEGER tEncodeStart = {};
+                    if (dwOptions & (UINT64_C(1) << OPT_TIMING))
+                    {
+                        std::ignore = QueryPerformanceCounter(&tEncodeStart);
+                    }
+
                     if (bc6hbc7 && pDevice)
                     {
                         hr = Compress(pDevice.Get(), img, nimg, info, tformat, dwCompress | dwSRGB, alphaWeight, *timage);
@@ -3778,6 +3830,25 @@ int __cdecl wmain(_In_ int argc, _In_z_count_(argc) wchar_t* argv[])
                     else
                     {
                         hr = Compress(img, nimg, info, tformat, cflags | dwSRGB, alphaThreshold, *timage);
+                    }
+
+                    if (dwOptions & (UINT64_C(1) << OPT_TIMING))
+                    {
+                        LARGE_INTEGER tEncodeEnd = {};
+                        std::ignore = QueryPerformanceCounter(&tEncodeEnd);
+                        const LONGLONG dt = tEncodeEnd.QuadPart - tEncodeStart.QuadPart;
+                        imgEncodeTicks += dt;
+                        totalEncodeTicks += dt;
+
+                        if (!useCompressionDomainMips)
+                        {
+                            const double secDecode = double(imgDecodeTicks) / double(qpcFreq.QuadPart);
+                            const double secDownsample = double(imgDownsampleTicks) / double(qpcFreq.QuadPart);
+                            const double secEncode = double(imgEncodeTicks) / double(qpcFreq.QuadPart);
+                            const double secTotal = secDecode + secDownsample + secEncode;
+                            wprintf(L" [Baseline Compute: %.6f s (Decode: %.6f s + Downsample: %.6f s + Encode: %.6f s)]",
+                                secTotal, secDecode, secDownsample, secEncode);
+                        }
                     }
                     if (FAILED(hr))
                     {
@@ -3797,11 +3868,6 @@ int __cdecl wmain(_In_ int argc, _In_z_count_(argc) wchar_t* argv[])
 
                         ScratchImage domainMipChain;
                         bool usedGpu = false;
-                        LARGE_INTEGER mipGenerationStart = {};
-                        if (dwOptions & (UINT64_C(1) << OPT_TIMING))
-                        {
-                            std::ignore = QueryPerformanceCounter(&mipGenerationStart);
-                        }
                         // Use the experimental DirectCompute path only when an adapter is selected explicitly.
                         if (adapter >= 0 && !(dwOptions & (UINT64_C(1) << OPT_NOGPU)))
                         {
@@ -3809,7 +3875,16 @@ int __cdecl wmain(_In_ int argc, _In_z_count_(argc) wchar_t* argv[])
                             {
                                 CreateDevice(adapter, pDevice.GetAddressOf());
                             }
+                        }
 
+                        LARGE_INTEGER mipGenerationStart = {};
+                        if (dwOptions & (UINT64_C(1) << OPT_TIMING))
+                        {
+                            std::ignore = QueryPerformanceCounter(&mipGenerationStart);
+                        }
+
+                        if (adapter >= 0 && !(dwOptions & (UINT64_C(1) << OPT_NOGPU)))
+                        {
                             if (pDevice)
                             {
                                 hr = GenerateCompressedMipMaps(pDevice.Get(), *compressedBase, tMips, domainMipChain);
@@ -3834,6 +3909,8 @@ int __cdecl wmain(_In_ int argc, _In_z_count_(argc) wchar_t* argv[])
                             LARGE_INTEGER mipGenerationEnd = {};
                             std::ignore = QueryPerformanceCounter(&mipGenerationEnd);
                             const LONGLONG mipDelta = mipGenerationEnd.QuadPart - mipGenerationStart.QuadPart;
+                            imgOurMipsTicks += mipDelta;
+                            totalOurMipsTicks += mipDelta;
                             wprintf(L" [mip generation: %.6f seconds]",
                                 double(mipDelta) / double(qpcFreq.QuadPart));
                         }
@@ -4140,6 +4217,7 @@ int __cdecl wmain(_In_ int argc, _In_z_count_(argc) wchar_t* argv[])
                 }
                 continue;
             }
+            ++processedImageCount;
             wprintf(L"\n");
         }
     }
@@ -4164,7 +4242,47 @@ int __cdecl wmain(_In_ int argc, _In_z_count_(argc) wchar_t* argv[])
         std::ignore = QueryPerformanceCounter(&qpcEnd);
 
         const LONGLONG delta = qpcEnd.QuadPart - qpcStart.QuadPart;
-        wprintf(L"\n Processing time: %f seconds\n", double(delta) / double(qpcFreq.QuadPart));
+
+        wprintf(L"\n========================================================================\n");
+        wprintf(L"                  BENCHMARK PURE COMPUTE SUMMARY                        \n");
+        wprintf(L"========================================================================\n");
+        wprintf(L" Total Processed Images: %zu\n", processedImageCount);
+
+        const bool isOurMethod = (dwOptions & (UINT64_C(1) << OPT_COMPRESSION_DOMAIN_MIPS)) != 0;
+        if (isOurMethod)
+        {
+            const double secOurTotal = double(totalOurMipsTicks) / double(qpcFreq.QuadPart);
+            wprintf(L" Method: [Our Method - Compression Domain Mipmap Generation]\n");
+            wprintf(L"   * Total Mipmap Generation Time: %.6f seconds\n", secOurTotal);
+            if (processedImageCount > 0)
+            {
+                wprintf(L"   * Average Time per Image:       %.6f seconds\n", secOurTotal / double(processedImageCount));
+            }
+            wprintf(L"   (Disk Read/Write I/O strictly excluded from compute time)\n");
+        }
+        else
+        {
+            const double secDec = double(totalDecodeTicks) / double(qpcFreq.QuadPart);
+            const double secDown = double(totalDownsampleTicks) / double(qpcFreq.QuadPart);
+            const double secEnc = double(totalEncodeTicks) / double(qpcFreq.QuadPart);
+            const double secBaseTotal = secDec + secDown + secEnc;
+
+            wprintf(L" Method: [DirectXTex Baseline - Decompress -> Downsample -> Compress]\n");
+            wprintf(L"   * Total Decoding Time   (Decompress):        %.6f seconds\n", secDec);
+            wprintf(L"   * Total Downsampling Time (GenerateMipMaps):   %.6f seconds\n", secDown);
+            wprintf(L"   * Total Encoding Time   (Compress):          %.6f seconds\n", secEnc);
+            wprintf(L"   --------------------------------------------------------------------\n");
+            wprintf(L"   * Total Pure Compute Time (Sum):             %.6f seconds\n", secBaseTotal);
+            if (processedImageCount > 0)
+            {
+                wprintf(L"   * Average Time per Image:                    %.6f seconds\n", secBaseTotal / double(processedImageCount));
+            }
+            wprintf(L"   (Disk Read/Write I/O strictly excluded from compute time)\n");
+        }
+
+        wprintf(L"   --------------------------------------------------------------------\n");
+        wprintf(L" Total Process Time (including Disk Read/Write): %.6f seconds\n", double(delta) / double(qpcFreq.QuadPart));
+        wprintf(L"========================================================================\n\n");
     }
 
     return retVal;

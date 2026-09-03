@@ -171,12 +171,7 @@ namespace
         ComPtr<ID3D11UnorderedAccessView>* uav,
         uint32_t& capacity) noexcept
     {
-        if (buffer != nullptr && capacity >= requiredCount)
-        {
-            return S_OK;
-        }
-
-        // Force buffer recreation by always proceeding.
+        // Force buffer recreation by always proceeding to avoid stale resource hazards.
         HRESULT hr = CreateStructuredBuffer(device, stride, requiredCount, nullptr, buffer, srv, uav);
         if (SUCCEEDED(hr))
             capacity = requiredCount;

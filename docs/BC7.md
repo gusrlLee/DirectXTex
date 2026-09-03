@@ -1,876 +1,480 @@
-# BC7 Compression-Domain Mipmap Generation — 통일 심볼 형식
+# BC7 Mode 7 및 공통 Subset 처리
 
-## 이 문서의 지위
+## 1. 구현한 범위
 
-**이것은 설계 문서다. 아직 구현되어 있지 않다.**
+이번 작업에서 구현한 내용은 다음과 같다.
 
-`docs/BC1.md` 는 저장소에 실재하는 코드를 서술한다.
-이 문서는 같은 아이디어를 BC7 로 확장하기 위한 **형식 유도와 구현 계획**이다.
-둘을 구분하기 위해 모든 주장에 상태를 표시했다.
+1. BC7의 1/2/3-subset 공간 배치를 공통 구조로 표현
+2. 모든 Mode 0~7의 subset 수와 partition bit 위치 정의
+3. 공통 SIMD partition 추출기 구현
+4. Mode 7 endpoint와 P-bit 복원
+5. Mode 1/7의 partitioned index 추출 공통화
+6. Mode 1/7의 2-subset 사분면 평균 계산 공통화
+7. Mode 7을 부모 블록 dispatcher에 연결
+8. 입력 검증에서 Mode 7 허용
 
-| 표기 | 의미 |
-|---|---|
-| `[코드]` | 이 저장소에 실재하는 코드 (`DirectXTex/BC6HBC7.cpp` 등) |
-| `[유도]` | 이 문서 안에서 증명한 것 |
-| `[설계]` | 제안. 아직 구현·검증되지 않음 |
-| `[미측정]` | 수치가 필요하지만 아직 없는 항목 |
+## 2. 공통 Subset 공간 구조
 
-BC1 에서 확립된 것과의 대응을 계속 표시한다.
-BC1 의 결과가 이미 `[측정]` 으로 검증된 부분은 그 사실을 명시한다.
+BC7 mode마다 subset 수와 partition 정보가 다르다.
 
----
+| Mode | Subset 수 | Partition 시작 bit | Partition bit 수 | Shape 수 |
+|---:|---:|---:|---:|---:|
+| 0 | 3 | 1 | 4 | 16 |
+| 1 | 2 | 2 | 6 | 64 |
+| 2 | 3 | 3 | 6 | 64 |
+| 3 | 2 | 4 | 6 | 64 |
+| 4 | 1 | 없음 | 0 | 1 |
+| 5 | 1 | 없음 | 0 | 1 |
+| 6 | 1 | 없음 | 0 | 1 |
+| 7 | 2 | 8 | 6 | 64 |
 
-## 목차
-
-1. [왜 BC1 방식을 그대로 쓸 수 없는가](#1-왜-bc1-방식을-그대로-쓸-수-없는가)
-2. [BC7 형식 요약](#2-bc7-형식-요약)
-3. [통일 심볼 형식의 유도](#3-통일-심볼-형식의-유도)
-4. [8개 모드 전체의 구체화](#4-8개-모드-전체의-구체화)
-5. [라운딩의 정확한 처리](#5-라운딩의-정확한-처리)
-6. [Skip-level 정리](#6-skip-level-정리)
-7. [SWAR 심볼 추출](#7-swar-심볼-추출)
-8. [구조 상속이 부산물로 나온다](#8-구조-상속이-부산물로-나온다)
-9. [확정해야 할 설계 결정](#9-확정해야-할-설계-결정)
-10. [구현 순서](#10-구현-순서)
-11. [미측정 항목](#11-미측정-항목)
-
----
-
-## 1. 왜 BC1 방식을 그대로 쓸 수 없는가
-
-BC1 알고리즘의 핵심은 `docs/BC1.md` §4.2 의 정리 1이다.
-
-$$
-\bar q = \frac{1}{4}\sum_{k=0}^{3} n_k\, u_k
-$$
-
-팔레트가 **4색뿐**이고 **블록 전체가 하나의 팔레트를 공유**하기 때문에
-selector 히스토그램 4개면 사분면 평균이 정확히 나온다.
-
-BC7 은 이 전제가 전부 깨진다.
-
-| | BC1 | BC7 |
-|---|---|---|
-| 모드 | 1개 (+3-color 변형) | **8개** |
-| subset | 1 | **1, 2, 또는 3** (파티션 테이블로 결정) |
-| 팔레트 크기 | 4 | 4, 8, 또는 **16** |
-| 엔드포인트 정밀도 | RGB565 고정 | 5·6·7·8 비트, 모드마다 다름 |
-| 인덱스 세트 | 1개 | 1개 또는 **2개** (색/알파 분리) |
-| 채널 순서 | 고정 | **rotation** 으로 A ↔ RGB 스왑 |
-| 블록당 팔레트 | 4색 | 최대 3 subset × 8색 = **24색** |
-
-`[코드]` `DirectXTex/BC6HBC7.cpp:1106-1122` (`D3DX_BC7::ms_aInfo`)
-
-순진하게 접근하면 모드마다 다른 자료구조와 커널이 필요하다.
-그러면 8벌의 코드와 8벌의 검증이 생긴다.
-
-**이 문서의 주장.** 압축 데이터를 *심볼* 로 다루면 8개 모드가 **하나의 식**으로 붕괴한다.
-
-$$
-\boxed{\;
-4\,y_{j,c} \;=\; \sum_{s}\Bigl[(n_{j,s}-\Sigma_{j,s})\,E_{0,s,c} \;+\; \Sigma_{j,s}\,E_{1,s,c}\Bigr] \;+\; \varrho_{j,c}
-\;}
-$$
-
-- $(n_{j,s},\,\Sigma_{j,s})$ = **쿼드 심볼**. 목적지 텍셀 $j$ 의 소스 2×2 쿼드에서
-  subset $s$ 에 속한 텍셀 수와 정규화 가중치 합.
-  **엔드포인트를 전혀 참조하지 않고** 인덱스 비트 + 파티션 라벨만으로 얻어진다.
-- $E$ = 언퀀타이즈된 8비트 엔드포인트. **모드와 무관하게 동일한 타입**.
-- $\varrho_{j,c}$ = 디코드 라운딩 보정. 팔레트 도메인에서 정확히 계산 가능, $|\varrho| \le 2$.
-
-그리고 이 형식에서 세 가지가 자동으로 따라 나온다.
-
-1. **모드 이질성이 두 개의 테이블 구성 $(\tilde B_b,\ \iota_\rho)$ 로 완전히 흡수된다**
-   → 커널 하나로 8모드 전부 처리 (§4)
-2. **레벨 $\ell \ge 2$ 는 레벨 0 의 블록 평균만으로 정확히 계산된다**
-   → 밉 체인 전체에서 오차 누적이 레벨 1 에만 국한 (§6)
-3. **쿼드 심볼의 희소성 패턴이 곧 구조 라벨(quad purity)** (§8)
-
----
-
-## 2. BC7 형식 요약
-
-유도에 필요한 만큼만 정리한다. 전부 저장소 코드로 확인 가능하다.
-
-### 2.1 보간 규칙
-
-$$
-D_{s,k,c} \;=\; \left\lfloor \frac{(64 - W_k)\,E_{0,s,c} \;+\; W_k\,E_{1,s,c} \;+\; 32}{64} \right\rfloor
-$$
-
-`[코드]` `BC6HBC7.cpp:394`
+이 차이를 다음 공통 메타데이터로 표현했다.
 
 ```cpp
-out.r = uint8_t((uint32_t(c0.r) * uint32_t(BC67_WEIGHT_MAX - aWeights[wc])
-               + uint32_t(c1.r) * uint32_t(aWeights[wc])
-               + BC67_WEIGHT_ROUND) >> BC67_WEIGHT_SHIFT);
-```
-
-`BC67_WEIGHT_MAX = 64`, `BC67_WEIGHT_ROUND = 32`, `BC67_WEIGHT_SHIFT = 6`
-`[코드]` `BC6HBC7.cpp:47-49`
-
-### 2.2 가중치 표
-
-$$
-\begin{aligned}
-W^{(2)} &= \{0,\ 21,\ 43,\ 64\} \\
-W^{(3)} &= \{0,\ 9,\ 18,\ 27,\ 37,\ 46,\ 55,\ 64\} \\
-W^{(4)} &= \{0,\ 4,\ 9,\ 13,\ 17,\ 21,\ 26,\ 30,\ 34,\ 38,\ 43,\ 47,\ 51,\ 55,\ 60,\ 64\}
-\end{aligned}
-$$
-
-`[코드]` `BC6HBC7.cpp:327-329`
-
-**세 표 모두 원소가 16개 이하다.** §7 에서 이 사실이 결정적으로 쓰인다.
-
-### 2.3 파티션과 anchor
-
-- `g_aPartitionTable[3][64][16]` — subset 수(1,2,3)별 × 파티션 ID 64개 × 텍셀 16개의 subset 라벨
-  `[코드]` `BC6HBC7.cpp:58`
-- `g_aFixUp[3][64][3]` — subset 별 anchor 텍셀 인덱스
-  `[코드]` `BC6HBC7.cpp:265`
-
-anchor 텍셀은 인덱스의 MSB 가 **생략되어 저장**된다 (항상 0 으로 가정).
-subset 0 의 anchor 는 언제나 텍셀 0 이다.
-
-### 2.4 회전 (rotation)
-
-모드 4, 5 는 디코드 **후** 채널을 스왑한다.
-
-```cpp
-switch (uRotation)
+struct BC7ModeSpatialInfo
 {
-case 1: std::swap(outPixel.r, outPixel.a); break;
-case 2: std::swap(outPixel.g, outPixel.a); break;
-case 3: std::swap(outPixel.b, outPixel.a); break;
-default: break;
-}
+    uint8_t subsetCount;
+    uint8_t partitionBitOffset;
+    uint8_t partitionBitCount;
+};
 ```
 
-`[코드]` `BC6HBC7.cpp:2761-2767`
+실제 texel의 공간 배치는 다음 구조로 표현한다.
 
-### 2.5 모드 파라미터
+```cpp
+struct BC7PartitionLayout
+{
+    const uint8_t* subsetByTexel;
+    std::array<uint8_t, 3> anchorTexel;
+    size_t subsetCount;
+};
+```
 
-`ms_aInfo` 의 필드는 `{uPartitions, uPartitionBits, uPBits, uRotationBits, uIndexModeBits, uIndexPrec, uIndexPrec2, RGBAPrec, RGBAPrecWithP}` 다.
-`[코드]` `BC6HBC7.cpp:780-790`
+- `subsetByTexel[t]`는 texel `t`가 속한 subset 번호이다.
+- `anchorTexel[s]`는 subset `s`의 anchor texel 번호이다.
+- `subsetCount`는 현재 mode가 사용하는 subset 수이다.
 
-`uPartitions` 는 **subset 수 − 1** 이다.
+1-subset mode는 모든 texel을 subset 0으로 지정한다. 2-subset과 3-subset mode는 `BC6HBC7.cpp`의 partition 및 fixup lookup table을 사용한다.
 
-| 모드 | ms_aInfo 원본 `[코드] BC6HBC7.cpp:1106-1122` |
-|---|---|
-| 0 | `{2, 4, 6, 0, 0, 3, 0, (4,4,4,0), (5,5,5,0)}` |
-| 1 | `{1, 6, 2, 0, 0, 3, 0, (6,6,6,0), (7,7,7,0)}` |
-| 2 | `{2, 6, 0, 0, 0, 2, 0, (5,5,5,0), (5,5,5,0)}` |
-| 3 | `{1, 6, 4, 0, 0, 2, 0, (7,7,7,0), (8,8,8,0)}` |
-| 4 | `{0, 0, 0, 2, 1, 2, 3, (5,5,5,6), (5,5,5,6)}` |
-| 5 | `{0, 0, 0, 2, 0, 2, 2, (7,7,7,8), (7,7,7,8)}` |
-| 6 | `{0, 0, 2, 0, 0, 4, 0, (7,7,7,7), (8,8,8,8)}` |
-| 7 | `{1, 6, 4, 0, 0, 2, 0, (5,5,5,5), (6,6,6,6)}` |
+예를 들어 다음 2-subset 배치는:
 
----
+```text
+0 0 1 1
+0 0 1 1
+0 0 1 1
+0 0 1 1
+```
 
-## 3. 통일 심볼 형식의 유도
+다음 배열로 표현된다.
 
-### 3.1 1단계 — 디코드는 채널별 아핀 사상
+```text
+{ 0,0,1,1, 0,0,1,1, 0,0,1,1, 0,0,1,1 }
+```
 
-소스 블록 $b$, 텍셀 $r$, 채널 $c \in \{R,G,B,A\}$ 에 대해
+## 3. 공통 Partition 추출
 
-$$
-x_{b,r,c} \;=\; D_{s,k,c}, \qquad s = s_b(r),\quad k = k_b(r,c)
-$$
+Mode를 `m`, 첫 번째 32-bit word를 `W`, partition 시작 bit를 `o_m`, partition bit 수를 `b_m`이라고 하자.
 
-**$k$ 가 $c$ 에 의존한다는 점이 중요하다.** 실제로 의존하는 것은 모드 4·5 뿐이지만,
-형식은 처음부터 일반적으로 세워야 한다.
-나중에 끼워 넣으려 하면 모드 4·5 에서 자료구조를 다시 짜야 한다.
+Partition 번호는 다음 식으로 구한다.
 
-$w = W_k / 64 \in [0,1]$ 로 두면 §2.1 의 식은
+\[
+P(W,m)=\left(W \gg o_m\right)\mathbin{\&}\left(2^{b_m}-1\right)
+\]
 
-$$
-D_{s,k,c} = \left\lfloor \frac{64\bigl[(1-w)E_{0,s,c} + w E_{1,s,c}\bigr] + 32}{64} \right\rfloor
-= \left\lfloor \hat x + \tfrac12 \right\rfloor
-$$
+Mode 4, 5, 6은 partition field가 없으므로 partition 0을 반환한다.
 
-여기서 $\hat x = (1-w)E_{0,s,c} + w E_{1,s,c}$ 다. 따라서
+`ExtractBC7Partition()`은 위 계산을 네 SIMD lane에 동시에 적용한다. `GetBC7ModePartitionLayout()`은 추출된 partition과 mode를 받아 공통 `BC7PartitionLayout`을 반환한다.
 
-$$
-\boxed{\;x_{b,r,c} \;=\; \underbrace{(1-w)E_{0,s,c} + w\,E_{1,s,c}}_{\hat x_{b,r,c}} \;+\; \underbrace{\rho_{s,k,c}}_{|\rho| \le 1/2}\;}
-$$
+## 4. Mode 7 Endpoint 복원
 
-**핵심 성질.** $\rho_{s,k,c}$ 는 $(s,k,c)$ 에만 의존한다.
-즉 **팔레트 엔트리 수만큼만 존재**하고 텍셀 수와 무관하다.
+Mode 7은 다음 endpoint 형식을 사용한다.
 
-$$
-|\{(s,k,c)\}| \;\le\; 3 \times 8 \times 4 \;=\; 96
-$$
+- RGBA channel
+- 2 subsets
+- subset마다 endpoint 2개
+- channel마다 5-bit 값
+- endpoint마다 고유한 P-bit 1개
 
-이것이 나중에 정확성을 거의 공짜로 유지시켜 준다 (§5).
+공통 endpoint 배열의 순서는 다음과 같다.
 
-### 3.2 2단계 — 엔드포인트 기저와 심볼 벡터
+```cpp
+value[subset][endpoint][channel]
+```
 
-블록 $b$ 의 모든 엔드포인트를 열로 쌓는다.
+Channel 번호는 `R=0`, `G=1`, `B=2`, `A=3`이다.
 
-$$
-\tilde B_b \;=\; \bigl[\,E_{0,0}\ \ E_{1,0}\ \ E_{0,1}\ \ E_{1,1}\ \cdots\,\bigr] \;\in\; \mathbb{Z}^{4 \times M_b},
-\qquad M_b = 2S_b
-$$
+Mode 7의 관련 bit 배치는 다음과 같다.
 
-채널 $c$ 의 행을 $\tilde b_{b,c}^\top \in \mathbb{Z}^{1 \times M_b}$ 라 하면
+| 값 | Bit 범위 |
+|---|---:|
+| Partition | 8–13 |
+| R endpoint 4개 | 14–33 |
+| G endpoint 4개 | 34–53 |
+| B endpoint 4개 | 54–73 |
+| A endpoint 4개 | 74–93 |
+| Endpoint P-bit 4개 | 94–97 |
+| Indices | 98–127 |
 
-$$
-\hat x_{b,r,c} \;=\; \tilde b_{b,c}^\top\, \gamma_{b,r,c},
-\qquad
-\gamma_{b,r,c} \;=\; (1-w)\,\mathbf e_{2s} \;+\; w\,\mathbf e_{2s+1}
-$$
+저장된 5-bit 값을 `v_5`, P-bit를 `p`라고 하면 먼저 6-bit 값을 만든다.
 
-$\gamma$ 는 **2-희소 단체(simplex) 벡터**다.
+\[
+v_6=(v_5\ll1)\mathbin{|}p
+\]
 
-- 모든 성분이 비음
-- 성분 합이 1
-- 지지집합(support)이 한 subset 의 두 열뿐
+그다음 Direct3D bit replication 규칙으로 8-bit 값까지 확장한다.
 
-### 3.3 3단계 — 회전의 흡수
+\[
+v_8=(v_6\ll2)\mathbin{|}(v_6\gg4)
+\]
 
-$$
-x_{b,r} = P_\rho\, d_{b,r}, \qquad P_\rho \in \{0,1\}^{4\times4}
-$$
+`UnquantizeBC7_5Bit()`가 이 계산을 수행한다. `ExtractBC7Mode7Endpoints()`는 네 endpoint의 RGBA 값을 복원하여 `BC7TwoSubsetEndpointBatch`에 저장한다.
 
-$\rho = 0$ 은 항등, $\rho = 1,2,3$ 은 각각 $A \!\leftrightarrow\! R$, $A \!\leftrightarrow\! G$, $A \!\leftrightarrow\! B$ 다.
-`[코드]` `BC6HBC7.cpp:2761`
+## 5. 공통 Index 표현과 Anchor 처리
 
-$P_\rho$ 는 상수 치환행렬이므로 합과 교환된다.
+Mode 1과 Mode 7의 index는 다음 공통 구조를 사용한다.
 
-$$
-P_\rho\Bigl(\sum_r d_r\Bigr) = \sum_r P_\rho d_r
-$$
+```cpp
+struct BC7IndexBatch
+{
+    XMVECTOR indices[16];
+};
+```
 
-따라서 **회전을 $\tilde B_b$ 의 행 치환으로 미리 흡수**해버리는 것이 깔끔하다.
+각 `XMVECTOR` lane은 서로 다른 BC7 블록의 같은 texel index를 가진다.
 
-$$
-\tilde B_b \;\leftarrow\; P_\rho \tilde B_b, \qquad
-\iota \;\leftarrow\; \iota \circ P_\rho^{-1}
-$$
+BC7은 각 subset의 anchor texel에서 index의 최상위 bit를 저장하지 않는다. 생략된 bit는 0으로 복원한다.
 
-이러면 언팩 단계 이후로는 **회전이 존재하지 않는다.**
-남는 것은 인덱스-세트 배정 함수 $\iota_\rho(c) \in \{0,1\}$ 뿐이다.
+Index precision을 `I`, texel을 `t`라고 하면 읽어야 하는 bit 수는 다음과 같다.
 
-### 3.4 4단계 — 쿼드 심볼로의 축약
-
-목적지 텍셀 $j$ 는 **정확히 하나의 소스 블록** $b(j)$ 의 2×2 쿼드 $Q_j$ 에서 온다.
-
-> **왜 하나인가.** 목적지 블록 격자는 소스 블록 격자의 절반이다.
-> 목적지 텍셀 $j$ 는 소스 텍셀 $2\times2$ 를 덮고, 그 4개는 소스 블록 경계를
-> 가로지르지 않는다 — 소스 블록이 4×4 이고 쿼드 경계가 짝수 좌표이기 때문이다.
-> BC1 에서도 같은 성질이 성립하며 `docs/BC1.md` §6.6 의 슬롯 배치가 그것이다.
-
-선형성으로
-
-$$
-4y_{j,c} \;=\; \sum_{r \in Q_j} x_{b,r,c}
-\;=\; \tilde b_{b,c}^\top \underbrace{\Bigl(\sum_{r \in Q_j} \gamma_{b,r,c}\Bigr)}_{=:\;g_{j,c}}
-\;+\; \underbrace{\sum_{r \in Q_j} \rho_{s_r,k_r,c}}_{=:\;\varrho_{j,c}}
-$$
-
-$g_{j,c} \in \mathbb{R}^{M_b}$ 가 **쿼드 심볼**이다. subset 별로 묶으면
-
-$$
-(g_{j,c})_{2s} = n_{j,s} - \Sigma_{j,s}, \qquad
-(g_{j,c})_{2s+1} = \Sigma_{j,s}
-$$
-
-$$
-n_{j,s} = \bigl|\{\,r \in Q_j : s_b(r) = s\,\}\bigr|, \qquad
-\Sigma_{j,s}^{(\iota)} = \!\!\sum_{r \in Q_j,\ s_b(r)=s}\!\! \frac{W_{k^{(\iota)}_r}}{64}
-$$
-
-**유도 확인.** $\gamma$ 의 $2s$ 성분은 $s_r = s$ 인 텍셀에 대해 $(1-w_r)$ 이므로
-
-$$
-\sum_{r \in Q_j} (\gamma_r)_{2s} = \sum_{r:\,s_r=s} (1 - w_r) = n_{j,s} - \Sigma_{j,s} \quad\checkmark
-$$
-
-### 3.5 쿼드 심볼의 성질
-
-| 성질 | 값 | 근거 |
-|---|---|---|
-| $\sum_s n_{j,s}$ | $= 4$ (항상) | 쿼드에 텍셀 4개 |
-| $64\,\Sigma_{j,s}$ | 정수, $\in [0, 256]$ | $W_k$ 가 정수, 최대 $4 \times 64$ |
-| $\|g_{j,c}\|_1$ | $= 4$ | $\sum_s[(n_s-\Sigma_s) + \Sigma_s] = \sum_s n_s$ |
-| 비영 subset 수 | $\le \min(4, S_b) \le 3$ | 쿼드 텍셀이 4개 |
-| 저장 비용 | subset 당 $(n,\ 64\Sigma)$ = 1 B + 2 B | |
-
-**목적지 텍셀 하나당 최대 9바이트**, 대부분은 pure quad 라 3바이트다.
-팔레트 전체(최대 24색 × 4채널 = 96 B/블록)를 들고 다니는 것보다 훨씬 가볍다.
-
-`[설계]` 이것이 BC7 확장에서 가장 걱정되는 레지스터 압력을 구조적으로 해소한다.
-
-### 3.6 BC1 과의 대응
-
-BC1 은 이 형식의 특수 케이스다.
-
-| BC7 심볼 형식 | BC1 대응 | BC1 코드 |
-|---|---|---|
-| $S_b = 1$ (subset 하나) | 항상 | — |
-| $M_b = 2$ | $c_0, c_1$ | `RGB8Batch` |
-| $W = \{0, 21, 43, 64\}$ → $w \in \{0, \frac13, \frac23, 1\}$ | BC1 은 정확히 $\{0,\frac13,\frac23,1\}$ | — |
-| $n_{j,s}$ | 항상 4 (subset 하나) | — |
-| $\Sigma_{j}$ | 히스토그램의 가중합 | `ExtractQuadrantWeight` |
-| $\varrho$ | BC1 은 무시 (팔레트를 정수로 만들어 씀) | `BuildOpaqueLinearPaletteBC1Batch` |
-
-BC1 이 히스토그램 $n_k$ 를 그대로 쓰는 이유는 subset 이 하나뿐이라
-$\Sigma$ 와 $n$ 이 같은 정보를 담기 때문이다.
-BC7 은 subset 이 여러 개라 둘을 분리해야 한다.
-
----
-
-## 4. 8개 모드 전체의 구체화
-
-### 4.1 마스터 테이블
-
-각 모드에 대해 필요한 것은 정확히 다섯 개다:
-$S$, $M = 2S$, $\tilde B$ 구성 규칙, 인덱스 세트 수, $\iota$.
-
-| 모드 | $S$ | $M$ | $\tilde B$ 행 구성 (RGB / A) | 인덱스 세트 | $\iota(c)$ | $W$ 표 |
-|---|---|---|---|---|---|---|
-| **0** | 3 | 6 | RGB: $(4{+}p) \to$ 5bit rep / A: **상수 255** | 1개, 3-bit | 전부 0 | $W^{(3)}$ |
-| **1** | 2 | 4 | RGB: $(6{+}p) \to$ 7bit rep / A: 255 | 1개, 3-bit | 전부 0 | $W^{(3)}$ |
-| **2** | 3 | 6 | RGB: 5bit rep / A: 255 | 1개, 2-bit | 전부 0 | $W^{(2)}$ |
-| **3** | 2 | 4 | RGB: $(7{+}p) \to$ 8bit (항등) / A: 255 | 1개, 2-bit | 전부 0 | $W^{(2)}$ |
-| **4** | 1 | 2 | RGB: 5bit rep / A: 6bit rep | **2개** (2-bit·3-bit, 선택자로 역할 교환) | $\iota_\rho$ | $W^{(2)}, W^{(3)}$ |
-| **5** | 1 | 2 | RGB: 7bit rep / A: 8bit (항등) | **2개**, 둘 다 2-bit | $\iota_\rho$ | $W^{(2)}$ |
-| **6** | 1 | 2 | RGBA: $(7{+}p) \to$ 8bit (항등) | 1개, 4-bit | 전부 0 | $W^{(4)}$ |
-| **7** | 2 | 4 | RGBA: $(5{+}p) \to$ 6bit rep | 1개, 2-bit | 전부 0 | $W^{(2)}$ |
-
-`[코드]` 전부 `BC6HBC7.cpp:1106-1122` 의 `ms_aInfo` 에서 직접 읽힌다.
-
-**$M \le 6$ 이 항상 성립한다.** 따라서 $\tilde B$ 는 최대 $4 \times 6$ int16 = **48 B** 다.
-소스 4블록이면 192 B = ymm 6개. 팔레트 방식(24색 × 4채널 × 2 B = 192 B/블록,
-4블록이면 12 ymm)의 절반이다.
-
-### 4.2 모드별로 실제 갈라지는 지점은 네 군데뿐
-
-"8모드"라는 말이 주는 인상보다 구현이 훨씬 단순하다.
-
-#### (D1) 엔드포인트 언퀀타이즈 — LUT 하나로 통합
-
-p-bit 결합 후 비트폭이 $q' \in \{5,6,7,8\}$ 이다.
-`rep`(비트 복제) 확장은 $q' \nmid 8$ 일 때 비선형이므로 LUT 가 필수다.
-
-$$
-\mathrm{LUT}_{q'} : \{0,\dots,2^{q'}-1\} \to [0,255]
-$$
-
-총 크기 $32 + 64 + 128 + 256 = 480$ B. **한 번 만들면 모드 분기가 사라진다.**
-
-`[설계]` 모드 3·5·6 은 8비트라 항등이므로 LUT 를 생략할 수 있지만,
-분기 균일성을 위해 그냥 LUT 를 태우는 편이 낫다.
-
-#### (D2) p-bit 결합
-
-$$
-v' = \begin{cases}
-2v + p_{\text{ep}} & \text{모드 0, 3, 6, 7 — 엔드포인트별 고유 p-bit} \\
-2v + p_{s} & \text{모드 1 — subset 공유 (두 엔드포인트가 같은 } p) \\
-v & \text{모드 2, 4, 5 — p-bit 없음}
+\[
+B(t)=
+\begin{cases}
+I-1,&t=anchor(subset(t))\\
+I,&\text{그 외}
 \end{cases}
-$$
+\]
 
-`[코드]` `ms_aInfo` 의 `uPBits`: 모드 0 은 6 (subset 3개 × 엔드포인트 2개),
-모드 1 은 2 (subset 2개 × 1), 모드 3·7 은 4 (subset 2개 × 2), 모드 6 은 2.
+`ExtractBC7PartitionedIndices()`는 다음 순서로 index를 읽는다.
 
-> **주의.** 모드 1 의 subset 공유 p-bit 는 인코딩 시에도 제약이 된다
-> (subset 당 후보가 2가지로 줄어든다).
-> 언팩·인코드 양쪽에서 실수하기 쉬우니 별도 유닛테스트를 두어야 한다. `[설계]`
+1. `subsetByTexel[t]`에서 texel의 subset을 찾는다.
+2. `anchorTexel[subset]`에서 해당 subset의 anchor를 찾는다.
+3. Anchor이면 `I-1` bit, 아니면 `I` bit를 읽는다.
+4. 생략된 최상위 bit는 0으로 유지한다.
 
-#### (D3) 알파 처리 — 3분류
+현재 Mode 1과 Mode 7은 이 함수를 함께 사용한다.
 
-$$
-\underbrace{\text{모드 0–3}}_{A \equiv 255} \quad\big|\quad
-\underbrace{\text{모드 4, 5}}_{A\ \text{독립 인덱스}} \quad\big|\quad
-\underbrace{\text{모드 6, 7}}_{A\ \text{결합 인덱스}}
-$$
+| Mode | Index 시작 bit | Index precision | Anchor 수 |
+|---:|---:|---:|---:|
+| 1 | 82 | 3-bit | 2 |
+| 7 | 98 | 2-bit | 2 |
 
-심볼 형식에서 각각 이렇게 나타난다.
+Mode 7에서는 전체 index가 차지하는 bit 수가 다음과 같이 30-bit가 된다.
 
-**모드 0–3.** $\tilde b_A^\top = (255, 255, \dots)$ 이므로
+\[
+16\times2-2=30\text{ bits}
+\]
 
-$$
-\tilde b_A^\top g_{j,A} = 255 \cdot \|g_{j,A}\|_1 = 255 \times 4 = 1020
-$$
+두 subset의 anchor에서 각각 1-bit씩 생략되기 때문이다.
 
-즉 $4y_{j,A} = 1020$, 라운딩도 없다. **자동으로 정확하다.**
-알파가 상수라는 사실이 심볼 형식에서 공짜로 떨어진다.
+## 6. Mode 7 Symbol 구조
 
-**모드 4, 5.** $\iota(A) \ne \iota(R)$ 이므로 $g_{j,A} \ne g_{j,R}$.
-채널별로 다른 심볼을 유지해야 한다.
+Mode 7에서 추출한 값은 다음 구조에 모인다.
 
-**모드 6, 7.** $g$ 가 전 채널 공통. 심볼 하나로 4채널 전부 처리.
-
-#### (D4) 인덱스 비트폭 + anchor 재삽입
-
-anchor 텍셀은 MSB 가 생략되어 있다. 위치는 파티션 ID 에 의존한다.
-`[코드]` `g_aFixUp[3][64][3]`, `BC6HBC7.cpp:265`
-
-```
-모드 0, 2        : 3-subset → anchor 3개
-모드 1, 3, 7     : 2-subset → anchor 2개
-모드 4, 5        : 인덱스 세트 2개, 각각 anchor 1개 (텍셀 0)
-모드 6           : anchor 1개 (텍셀 0)
+```cpp
+struct BC7Mode7SymbolBatch
+{
+    XMVECTOR activeMask;
+    XMVECTOR partition;
+    BC7TwoSubsetEndpointBatch endpoints;
+    BC7IndexBatch indices;
+};
 ```
 
-subset 0 의 anchor 는 언제나 텍셀 0 이다.
+- `activeMask`: Mode 7인 SIMD lane
+- `partition`: 각 lane의 partition 번호
+- `endpoints`: RGBA8로 복원된 두 subset의 endpoint
+- `indices`: anchor bit가 복원된 16개 index
 
-> **순서가 중요하다.** anchor MSB 를 **재삽입한 뒤에** $W_k$ LUT 를 태워야 한다.
-> 순서가 바뀌면 조용히 틀린 값이 나온다. `[설계]`
+`ExtractBC7Mode7Symbols()`가 압축된 `BC7BlockBatch`를 이 구조로 변환한다.
 
-### 4.3 검증 기준
+## 7. BC7 Palette 복원
 
-각 모드에 대해 다음이 **비트 동일**해야 한다.
+두 endpoint를 `e_0`, `e_1`, index에 해당하는 정수 weight를 `w_i`라고 하면 palette 값은 다음과 같다.
 
-$$
-\underbrace{\tilde b_{b,c}^\top \gamma_{b,r,c} + \rho_{s,k,c}}_{\text{심볼 경로}}
-\;\overset{!}{=}\;
-\underbrace{\texttt{D3DXDecodeBC7}(\text{blob})_{r,c}}_{\text{레퍼런스}}
-$$
+\[
+c_i=\left\lfloor
+\frac{(64-w_i)e_0+w_i e_1+32}{64}
+\right\rfloor
+\]
 
-$\rho$ 를 팔레트 도메인에서 미리 계산하므로 **정수 산술만으로 비트 일치가 가능**하다.
+Mode 1의 3-bit weight는 다음과 같다.
 
-`[설계]` 이것은 BC1 에서 쓴 float 검증(오차 $1.3 \times 10^{-7}$)보다 훨씬 강한 보증이며,
-하드웨어 디코더와의 일치를 보장한다.
-BC1 검증 방식은 `docs/BC1.md` §8.1 참조.
-
----
-
-## 5. 라운딩의 정확한 처리
-
-$\varrho_{j,c} = \sum_{r \in Q_j} \rho_{s_r,k_r,c}$ 를 계산하려면
-쿼드 안 각 텍셀의 $(s,k)$ 가 필요하다. 즉 심볼만으로는 부족하다.
-세 가지 선택지가 있다.
-
-| 방식 | 비용 | 정확도 | $y$ 타깃 |
-|---|---|---|---|
-| **(R0)** $\varrho$ 무시 | 0 | 튜브 $\pm2$ | 아핀 근사 |
-| **(R1)** $\rho$ 히스토그램 | $\rho$ LUT ($\le 96$ B) + 쿼드당 4 게더 | **정확** | 실제 디코드값 |
-| **(R2)** 팔레트 완전 게더 | 팔레트 빌드 + 쿼드당 4 게더 | 정확 | 실제 디코드값 |
-
-**$|\varrho| \le 2$ 인 이유.** $|\rho| \le 1/2$ 이고 쿼드에 텍셀이 4개이므로
-$|\varrho| \le 4 \times \frac12 = 2$. $\square$
-
-(R1) 과 (R2) 는 게더 횟수가 같다. 차이는 두 가지다.
-
-- 게더 대상이 $\rho$ (작은 값, int8 로 충분) 냐 $D$ (int16) 냐
-- (R1) 은 **주 항을 심볼 내적으로 처리하므로 엔드포인트 의존성을 뒤로 미룰 수 있다**
-
-### 5.1 권고
-
-`[설계]` **(R1) 을 기본으로, (R0) 는 프루닝 전용으로만.**
-
-이유: $y_j$ 자체가 $\pm2$ 어긋나면 그건 근사가 아니라 **다른 타깃**이다.
-밉 레벨이 깊어질수록 데이터 range 가 좁아지므로 상대 오차는 커진다.
-
-BC1 에서 같은 논리가 확인된다. `docs/BC1.md` §6.5 에서 팔레트를 **정수 코드 공간**에서
-만드는 이유가 정확히 이것이다 — 선형 공간에서 $1/3, 2/3$ 보간을 하면
-하드웨어와 다른 값이 나온다.
-
-다만 (R0) 는 **스크리닝 단계에서 유용하다.**
-$\tilde B^\top g$ 만으로 근사 타깃을 만들어 싼 하한을 계산하고,
-살아남은 후보에만 $\varrho$ 를 붙이는 2단 구조가 가능하다.
-이때 하한의 허용성(admissibility)을 유지하려면 감가폭을 $2\sqrt{nD}$ 만큼 키워야 한다.
-
----
-
-## 6. Skip-level 정리
-
-여기가 심볼 형식의 가장 큰 배당금이다.
-
-### 6.1 관찰
-
-레벨 $\ell$ 의 텍셀 $(X,Y)$ 는 레벨 0 의 영역
-
-$$
-[\,2^\ell X,\ 2^\ell(X{+}1)\,) \times [\,2^\ell Y,\ 2^\ell(Y{+}1)\,)
-$$
-
-의 평균이다. $\ell \ge 2$ 이면 $2^\ell$ 은 4의 배수이고 시작점도 $2^\ell$ 의 배수이므로,
-**이 영역은 레벨 0 블록들의 정확한 합집합**이다 ($4^{\ell-2}$ 개).
-
-### 6.2 정리 S
-
-**주장.** $\ell \ge 2$ 에 대해
-
-$$
-R^{\text{dec}}_{\ell}(X,Y) \;=\; \frac{1}{4^{\ell-2}}\sum_{b \in \mathcal B(X,Y)} \mu_b,
-\qquad
-\mu_b := \frac{1}{16}\sum_{r=0}^{15} x_{b,r}
-$$
-
-이고, 블록 평균 $\mu_b$ 는 심볼 형식에서 $O(S)$ 로 **정확히** 얻어진다.
-
-$$
-16\,\mu_{b,c} \;=\; \sum_{s}\Bigl[(n_s - \Sigma_s)E_{0,s,c} + \Sigma_s E_{1,s,c}\Bigr] + \varrho_{b,c}
-$$
-
-$$
-n_s = \bigl|\{\,r : s(r) = s\,\}\bigr|, \qquad
-\Sigma_s = \!\!\sum_{r:\,s(r)=s}\!\! \frac{W_{k_r}}{64}, \qquad
-\sum_s n_s = 16
-$$
-
-**유도.** 두 부분이다.
-
-*(1) 블록 심볼.* 블록 전체 심볼은 쿼드 심볼 4개의 합이다.
-
-$$
-\Gamma_b \;=\; \sum_{r=0}^{15} \gamma_r \;=\; \sum_{q=0}^{3} g_q
-$$
-
-$\gamma$ 의 선형성으로 $16\mu_{b,c} = \tilde b_{b,c}^\top \Gamma_b + \varrho_{b,c}$.
-$\Gamma_b$ 의 subset $s$ 성분은 쿼드 심볼과 같은 형태로
-$(n_s - \Sigma_s,\ \Sigma_s)$ 다. 단 이번엔 16개 텍셀에 대한 합이다.
-
-*(2) 박스 평균의 결합성.* 레벨 $\ell$ 영역이 레벨 0 블록 $4^{\ell-2}$ 개의
-정확한 합집합이고 각 블록의 텍셀 수가 같으므로, 부분 평균의 평균이 전체 평균이다. $\square$
-
-이것은 `docs/BC1.md` §4.4 의 정리 3과 같은 내용이며,
-BC1 에서는 이미 `[측정]` 으로 검증되어 mip 2 이상 경로의 기반이 되어 있다.
-
-### 6.3 왜 이것이 큰가
-
-#### (가) 오차 누적이 레벨 1 에만 국한된다
-
-기존 재귀 파이프라인은 $\hat y_1 \to \hat y_2 \to \hat y_3 \to \cdots$ 로,
-각 단계마다 인코더 오차와 재양자화가 누적된다.
-
-DirectXTex 가 정확히 그렇게 동작한다.
-`[코드]` `DirectXTexMipmaps.cpp:1036` — `GetImage(level - 1, ...)`
-그리고 `[측정]` 그 누적량은 mip 1 에서 58.93 dB, mip 12 에서 49.78 dB 로
-**9 dB 열화**한다 (`docs/BC1.md` §2.2).
-
-스킵 경로에서는 $\ell = 1$ 만 레벨 0 에서 만들고,
-$\ell = 2, 3, 4, \dots$ 는 **전부 레벨 0 에서 직접** 만든다.
-각 레벨의 타깃이 정확하므로
-
-$$
-\bigl\|R^{\text{dec}}_\ell - \hat y_\ell\bigr\|^2 = (\text{레벨 } \ell \text{ 인코더 오차만}),
-\qquad (\text{누적 항}) = 0
-$$
-
-#### (나) 비용이 극적으로 낮다
-
-레벨 $\ell \ge 2$ 목적지 텍셀 하나당: **팔레트 빌드 없음, 게더 없음.**
-필요한 것은 $(n_s, \Sigma_s)$ 뿐이다 — 인덱스 비트에 $W$ LUT 를 태우고
-subset 마스크로 합산하면 끝이다.
-
-그리고 $\mu_b$ 는 **레벨 0 블록당 한 번만** 계산하면 모든 $\ell \ge 2$ 가 재사용한다.
-
-$$
-(\text{총 } \mu \text{ 계산 비용}) = B_0 \times O(S) \quad (\text{레벨 0 블록 수만큼, 단 1회})
-$$
-
-#### (다) 저장 비용
-
-$\mu_b$ 를 int16 × 4 = 8 B 로 저장한다.
-레벨 0 블록당 8 B = 압축 크기(16 B)의 0.5배.
-64×64 영역 타일링(256 블록 = 2 KB)이면 L1 상주다.
-
-BC1 은 이 역할을 `LinearBlockMean` (float × 3 = 12 B) 이 한다.
-`[코드]` `DirectXTexCompressedMips.cpp:217`
-
-### 6.4 감마가 있으면
-
-sRGB 에서는 $\mu_b$ 가 **선형광 평균**이어야 하므로 $\tilde B^\top \Gamma$ 내적이 깨진다.
-비선형 함수는 합과 교환되지 않기 때문이다.
-
-$$
-\mathrm{EOTF}\Bigl(\frac{1}{16}\sum_r D_r\Bigr) \;\ne\; \frac{1}{16}\sum_r \mathrm{EOTF}(D_r)
-$$
-
-하지만 **히스토그램으로 대체된다.**
-
-$$
-16\,\mu^{\rm lin}_{b,c} \;=\; \sum_{s,k} n_{b,s,k}\cdot \mathrm{EOTF}\bigl(D_{s,k,c}\bigr)
-$$
-
-$n_{b,s,k}$ 는 인덱스 히스토그램(엔트리 $\le 24$ 개),
-$\mathrm{EOTF}(D)$ 는 팔레트 도메인 LUT 다.
-**여전히 텍셀 재료화가 없다.** 정리 S 는 감마 하에서도 성립한다.
-
-> 이것이 BC1 의 `ComputePaletteMean` 과 정확히 같은 구조다.
-> `[코드]` `DirectXTexCompressedMips.cpp:408-435`
-> BC1 은 $S=1$, 팔레트 4색이라 히스토그램이 4개짜리로 축소된 것뿐이다.
-
-### 6.5 주의점 — 이것이 "그냥 더 좋은" 것은 아니다
-
-정직하게 짚는다.
-
-- 정리 S 는 **타깃 계산**만 스킵한다. 각 레벨의 **인코딩**은 여전히 해야 한다.
-- 레벨 1 은 여전히 풀 경로다. 그리고 픽셀 수 기준으로 밉 체인의
-  $\frac{1/4}{1/3} = 75\%$ 가 레벨 1 이다. 즉 **총 비용의 대부분은 여전히 레벨 1** 이다.
-- 스킵의 이득은 "속도"보다 **"품질 + 단순성"** 쪽이 크다.
-
-논문에서는 (가) 를 전면에 내세우는 것이 맞다:
-*"레벨 2 이상은 소스 압축 데이터로부터 디코드값을 정확히 재현하며, 재귀 오차 누적이 없다."*
-
-`[미측정]` 재귀 경로 대비 스킵 경로의 dB 이득. 레벨 4–6 에서 클 것으로 예상되지만
-실측이 필요하다. 구현 난도가 낮으므로 **초기에 측정 가능한 성과**다.
-
----
-
-## 7. SWAR 심볼 추출
-
-BC1 에서 SWAR 사분면 카운터(`Count2x2Regions`)가 최대 기여였던 것과
-정확히 대응되는 지점이다. `docs/BC1.md` §6.3 참조.
-
-### 7.1 파이프라인
-
-```
-128-bit blob
-  │ (1) 모드 판별                  lzcnt / tzcnt (선행 0 개수 = 모드 번호)
-  │ (2) 모드별 shuffle 마스크 테이블 → 인덱스 필드 분리
-  │ (3) 인덱스 언팩                 nibble / 2bit / 3bit → byte 16개
-  │ (4) anchor MSB 재삽입           파티션 의존 마스크
-  │ (5) W LUT                       _mm_shuffle_epi8       ← 핵심
-  │ (6) 파티션 테이블 → subset 마스크 최대 3개
-  │ (7) 쿼드 × subset 마스크 AND → 수평합
-  ▼
-(n_{j,s},  64·Σ_{j,s})
+```text
+{ 0, 9, 18, 27, 37, 46, 55, 64 }
 ```
 
-### 7.2 (5) 가 왜 공짜인가
+Mode 7의 2-bit weight는 다음과 같다.
 
-`pshufb` 는 16엔트리 바이트 LUT 다. 그리고 §2.2 에서 확인했듯
+```text
+{ 0, 21, 43, 64 }
+```
 
-$$
-|W^{(2)}| = 4, \qquad |W^{(3)}| = 8, \qquad |W^{(4)}| = 16
-$$
+`LookupBC7Weight<IndexBits>()`가 index를 실제 BC7 weight로 바꾼다. `InterpolateBC7PaletteVector()`는 정수 반올림을 포함한 palette 복원식을 적용한다.
 
-**세 표 모두 16 이하다.**
-따라서 $W$ 표를 xmm 레지스터에 얹고 인덱스 바이트 벡터에 `pshufb` **한 번**이면
-16 텍셀의 $W_{k_r}$ 이 전부 나온다. 모드에 따라 로드하는 표만 바뀐다.
+## 8. Mode 1/7 공통 사분면 평균
 
-$W^{(4)}$ 의 최댓값이 64 이므로 uint8 에 들어간다.
-쿼드 4개 합의 최댓값은 256 이므로 uint16 승격이 필요하다
-(`_mm_cvtepu8_epi16` 또는 `_mm_maddubs_epi16`).
+Mode 1과 Mode 7은 endpoint 정밀도와 index precision이 다르지만, endpoint와 index를 공통 구조로 복원한 이후의 계산은 같다.
 
-### 7.3 (7) 쿼드 × subset 합
+두 mode는 다음 공통 함수를 사용한다.
 
-쿼드의 텍셀 인덱스는
+```cpp
+ComputeBC7TwoSubsetQuadrantMeans<IndexBits>()
+```
 
-$$
-Q_0 = \{0,1,4,5\},\quad Q_1 = \{2,3,6,7\},\quad Q_2 = \{8,9,12,13\},\quad Q_3 = \{10,11,14,15\}
-$$
+각 texel `t`에 대해 먼저 subset과 weight를 찾는다.
 
-`_mm_maddubs_epi16` 을 subset 마스크(0/1 바이트)와 함께 쓰면
-곱셈-누산이 한 명령에 되고, 이후 `_mm_hadd_epi16` 2단계로 쿼드 합이 된다.
+\[
+s_t=subsetByTexel[t]
+\]
 
-$$
-64\,\Sigma_{j,s} = \texttt{hadd}\bigl(\texttt{maddubs}(W_{\text{vec}},\ \text{mask}_s)\bigr)_j
-$$
+\[
+w_t=WeightTable[index_t]
+\]
 
-$n_{j,s}$ 는 마스크 자체의 popcount 다 — `maddubs` 에 $W$ 대신 상수 1 벡터를 넣으면
-동일 경로로 얻어진다.
+그다음 해당 subset의 두 endpoint로 RGBA8 texel을 복원한다.
 
-**subset 수 $S$ 만큼 반복** → 최대 3회.
-모드 4·5·6 은 $S = 1$ 이라 1회이고, 마스크가 전부 1 이므로 마스크 AND 도 생략된다.
+\[
+C_t=BC7Interpolate(E_{s_t,0},E_{s_t,1},w_t)
+\]
 
-### 7.4 추정 비용
+4×4 블록의 네 사분면은 다음 texel로 구성된다.
 
-| 단계 | 명령 수 (블록당) |
-|---|---|
-| (1)(2) 모드 판별 + shuffle | ~8 |
-| (3)(4) 인덱스 언팩 + anchor | ~15 |
-| (5) $W$ LUT | **1** |
-| (6) 파티션 마스크 | ~4 (테이블 로드) |
-| (7) $S$회 × (maddubs + hadd×2) | ~9–27 |
-| **합** | **~40–55** |
+```text
+Q0 = { 0,  1,  4,  5 }
+Q1 = { 2,  3,  6,  7 }
+Q2 = { 8,  9, 12, 13 }
+Q3 = {10, 11, 14, 15 }
+```
 
-`[미측정]` BC1 의 SWAR 추출이 약 17 ops 였던 것과 비교하면 2–3배지만,
-BC7 의 정보량(파티션 · 다중 subset · 가변 비트폭)을 고려하면 타당한 수준으로 보인다.
-실측이 필요하다.
+사분면 `q`의 channel `c` 평균은 다음과 같다.
 
----
+\[
+Q_{q,c}=\frac{1}{4\times255}\sum_{t\in q}C_{t,c}
+\]
 
-## 8. 구조 상속이 부산물로 나온다
+결과는 RGBA `[0,1]` 범위의 `BC7QuadrantMeanBatch`에 저장된다.
 
-목적지 텍셀의 subset 라벨을 소스에서 물려받는 문제("구조 상속")는
-쿼드 심볼의 **희소성 패턴**과 동일한 개념이다.
+Mode 1은 3-bit weight 버전을 사용한다.
 
-$$
-j \text{ 가 pure-}(b,s) \iff n_{j,s} = 4 \iff \mathrm{supp}(g_j) = \{2s,\ 2s+1\}
-$$
+```cpp
+ComputeBC7TwoSubsetQuadrantMeans<3>(...)
+```
 
-즉 §7.3 (7) 에서 $n_{j,s}$ 를 계산하는 순간 **라벨장이 이미 나와 있다.** 추가 비용 0.
+Mode 7은 2-bit weight 버전을 사용한다.
 
-그리고 mixed 텍셀의 "혼합도"도 정량화된다.
+```cpp
+ComputeBC7TwoSubsetQuadrantMeans<2>(...)
+```
 
-$$
-\mathrm{purity}(j) = \max_s \frac{n_{j,s}}{4} \in \left\{\tfrac14,\ \tfrac12,\ \tfrac34,\ 1\right\}
-$$
+## 9. Mode 7 Dispatcher 연결
 
-**유도.** 쿼드에 텍셀이 4개이고 $\sum_s n_{j,s} = 4$ 이므로
-$\max_s n_{j,s} \in \{1,2,3,4\}$. (1이면 4개 텍셀이 모두 다른 subset 인데
-subset 은 최대 3개이므로 실제로는 $\max \ge 2$.) $\square$
+`ComputeBC7ParentQuadrantMeans()`에 Mode 7 분기를 추가했다.
 
-이 값이 볼록결합 계수 그 자체이므로 다음이 바로 따라 나온다.
+처리 순서는 다음과 같다.
 
-- **가중 PCA**: $n_{j,s} < 4$ 인 텍셀에 가중치 $\alpha < 1$ 을 준다.
-  $\alpha = (n_{j,s}/4)^2$ 같은 정책이 자연스럽다. `[설계]`
-- **목표 라벨장 $\tau$**: pure 텍셀은 $\arg\max_s n_{j,s}$ 로 즉시 결정,
-  mixed 는 클러스터 중심 최근접.
-- **파티션 후보 선택**: $\tau$ 를 16비트로 패킹하면
-  64개 파티션과의 Hamming 거리가 XOR + POPCNT 64회로 끝난다.
+```text
+Mode 7 mask 생성
+    → partition 추출
+    → endpoint 복원
+    → index 복원
+    → 사분면 평균 계산
+    → 공통 BC7QuadrantMeanBatch에 병합
+```
 
-**즉 구조 상속 전체가 언팩 단계의 부산물이다.**
-이것이 "왜 압축 도메인인가"에 대한 가장 깔끔한 답이고,
-심볼 형식이 그것을 명시적 자료구조로 만들어 준다.
+Mode별 `activeMask`는 서로 겹치지 않는다. 따라서 Mode 1, Mode 6, Mode 7의 결과를 bitwise OR로 병합할 수 있다.
 
----
+```text
+Q = Q1 | Q6 | Q7
+```
 
-## 9. 확정해야 할 설계 결정
+이 OR 연산은 실수의 수치 덧셈이 아니다. 각 SIMD lane에서 해당 mode의 결과만 0이 아니므로 올바른 lane 값을 선택하는 역할을 한다.
 
-구현 전에 갈리는 지점이 네 개다. `[설계]`
+## 10. 입력 검증 변경
 
-### D1. 쿼드 심볼을 재료화할 것인가, 즉시 접을 것인가
+`IsSupportedBC7Image()`가 허용하는 부모 mode를 다음과 같이 확장했다.
 
-| | 장점 | 단점 |
-|---|---|---|
-| (a) 재료화 | $g$ 16개 저장 (최대 144 B). 여러 후보 / 여러 $\tilde B$ 실험에 재사용. 스킵 레벨에도 유리 | 메모리 |
-| (b) 즉시 접기 | $\tilde B^\top g$ 를 바로 계산하고 $g$ 버림. 메모리 최소 | 재사용 불가 |
+```text
+기존: Mode 1, Mode 6, Mode 7
+1단계: Mode 0, Mode 1, Mode 2, Mode 3, Mode 6, Mode 7
+2단계(완료): Mode 0, 1, 2, 3, 4, 5, 6, 7 (BC7 8대 전 모드 100% 지원)
+```
 
-레벨 1 만 보면 (b) 가 낫지만, **정리 S 를 쓰려면 블록 심볼 $\Gamma_b$ 는 어차피 유지해야 한다.**
+## 11. 다중 서브셋 모드(Mode 0, 2, 3) 통합 구조
 
-**권고: 하이브리드.** 쿼드 심볼은 즉시 접고, 블록 심볼 $(n_s, \Sigma_s)$ 만 유지한다.
-블록당 $\le 6$ 개 int16 = 12 B.
+3-subset 및 2-subset 분할 모드를 효율적으로 지원하기 위해 endpoint 및 사분면 평균 계산기를 다중 서브셋 구조로 일반화했다.
 
-### D2. $\varrho$ 경로를 (R1) 로 갈 것인가
+### 11.1 다중 서브셋 Endpoint 구조 (`BC7MultiSubsetEndpointBatch`)
+
+최대 3개 서브셋(Mode 0, 2)까지 보관할 수 있도록 endpoint 버퍼를 확장했다.
+
+```cpp
+struct BC7MultiSubsetEndpointBatch
+{
+    XMVECTOR value[3][2][4]; // [subsetIndex 0..2][endpoint 0..1][channel 0..3]
+};
+using BC7TwoSubsetEndpointBatch = BC7MultiSubsetEndpointBatch;
+```
+
+### 11.2 모드별 비트 레이아웃 및 역양자화(Unquantization)
+
+| Mode | Subsets | 색상 비트 | P-bits | Index 비트 / 시작 비트 | 역양자화(Unquantize) 공식 |
+|---:|---:|---:|---:|---:|:---|
+| **Mode 0** | 3 | RGB 444 | 6개 (EP당 1개) | 3-bit / 83 | $v_5=(v_4\ll1)\mid p$, $v_8=(v_5\ll3)\mid(v_5\gg2)$ |
+| **Mode 1** | 2 | RGB 666 | 2개 (Subset당 1개) | 3-bit / 82 | $v_7=(v_6\ll1)\mid p$, $v_8=(v_7\ll1)\mid(v_7\gg6)$ |
+| **Mode 2** | 3 | RGB 555 | 0개 | 2-bit / 99 | $v_8=(v_5\ll3)\mid(v_5\gg2)$ |
+| **Mode 3** | 2 | RGB 777 | 4개 (EP당 1개) | 2-bit / 98 | $v_8=(v_7\ll1)\mid p$ |
+| **Mode 7** | 2 | RGBA 5555 | 4개 (EP당 1개) | 2-bit / 98 | $v_6=(v_5\ll1)\mid p$, $v_8=(v_6\ll2)\mid(v_6\gg4)$ |
+
+### 11.3 일반화된 다중 서브셋 사분면 평균 (`ComputeBC7MultiSubsetQuadrantMeans`)
+
+서브셋 인덱스 $s_t \in \{0, 1, 2\}$에 따라 SIMD 레지스터에서 endpoint를 동적으로 선택하고 하드웨어 weight 테이블로 색상을 복원한다.
+
+```text
+ep0 = Select(subset0, subset1, isSubset1)
+ep0 = Select(ep0,     subset2, isSubset2)
+ep1 = Select(subset0, subset1, isSubset1)
+ep1 = Select(ep1,     subset2, isSubset2)
+```
+
+## 12. 1-Subset 듀얼 인덱스 및 채널 로테이션 모드(Mode 4, Mode 5) 통합 구조
+
+Mode 4와 Mode 5는 1개의 서브셋을 가지며, 색상과 알파(또는 스왑된 채널)에 대해 서로 다른 독립된 인덱스 스트림을 적용한다.
+
+### 12.1 모드별 비트 레이아웃 및 정밀도
+
+| Mode | 회전 비트 | 인덱스 모드 | 색상 정밀도 | 알파 정밀도 | 인덱스 1 (시작/비트) | 인덱스 2 (시작/비트) |
+|---:|---:|---:|:---|:---|:---|:---|
+| **Mode 4** | 2-bit (5..6) | 1-bit (7) | RGB 555 | A 6 | 50 / 2-bit (31b) | 81 / 3-bit (47b) |
+| **Mode 5** | 2-bit (6..7) | 없음 | RGB 777 | A 8 | 66 / 2-bit (31b) | 97 / 2-bit (31b) |
+
+- **역양자화 공식**:
+  - Mode 4 A (6-bit): $v_8 = (v_6 \ll 2) \mid (v_6 \gg 4)$
+  - Mode 5 RGB (7-bit): $v_8 = (v_7 \ll 1) \mid (v_7 \gg 6)$
+  - Mode 5 A (8-bit): 그대로 사용
+
+### 12.2 인덱스 셀렉터(`IndexMode`) 해석 (Mode 4)
+- `IndexMode == 0`: 색상 가중치 = 2-bit(`idx1`), 알파 가중치 = 3-bit(`idx2`)
+- `IndexMode == 1`: 색상 가중치 = 3-bit(`idx2`), 알파 가중치 = 2-bit(`idx1`)
+
+### 12.3 SIMD 채널 로테이션(Channel Rotation) 벡터화
+보간된 $(R, G, B, A)$ 채널에 대해 회전 필드 $R \in \{0, 1, 2, 3\}$에 따라 알파 채널과 주 채널을 조건부 교환한다:
+- $R=0$: 회전 없음 $(R, G, B, A)$
+- $R=1$: $R \leftrightarrow A$ 스왑 $(A, G, B, R)$
+- $R=2$: $G \leftrightarrow A$ 스왑 $(R, A, B, G)$
+- $R=3$: $B \leftrightarrow A$ 스왑 $(R, G, A, B)$
+
+이 로직은 분기문 없이 `XMVectorSelect`를 통해 4개의 SIMD 레인에서 100% 벡터화되어 동작한다.
+
+### 12.4 최종 부모 블록 디스패처 병합 (`ComputeBC7ParentQuadrantMeans`)
+
+8개 모드의 `activeMask`는 서로 배타적이므로, SIMD lane별 최종 사분면 평균은 다음 8모드 bitwise OR로 병합된다:
+
+\[
+Q = Q_0 \mid Q_1 \mid Q_2 \mid Q_3 \mid Q_4 \mid Q_5 \mid Q_6 \mid Q_7
+\]
+
+## 13. FasTC 해밍 거리 기반 2-서브셋 파티션 추정 (`EstimateBC7Partition2Subsets`)
+
+2-서브셋 모드(Mode 1)의 64개 파티션을 전수조사하는 대신, FasTC 논문(Krajcevski et al., 2013)의 해밍 거리 투영 기법을 채택하여 **임의의 Threshold 없이** 단 하나의 최적 파티션 $S^*$를 $O(1)$로 결정한다.
+
+### 13.1 16비트 투영 마스크 및 최소 해밍 거리 ($\arg\min$)
+
+1. **주축 투영**:
+   각 자식 텍셀 $C_t$를 캔버스의 PCA 주축 $V$에 투영한다:
+   \[
+   p_t = (C_t - \mu) \cdot V
+   \]
+2. **16비트 바이너리 마스크 생성**:
+   중심값(0)을 기준으로 16비트 마스크 $M_{\text{proj}}$를 구성한다:
+   \[
+   M_{\text{proj}} = \sum_{t=0}^{15} \left( (p_t \ge 0) \ll t \right)
+   \]
+3. **해밍 거리 최소화**:
+   사전 계산된 64개 파티션 마스크 $M_s$와 XOR 후 하드웨어 팝카운트(`_mm_popcnt_u32`)를 수행한다. 서브셋 극성(Polarity) 불변성을 위해 반전 마스크와의 거리도 함께 계산한다:
+   \[
+   d(s) = \min\Big(\text{popcnt}(M_{\text{proj}} \oplus M_s), \; \text{popcnt}((\sim M_{\text{proj}}) \oplus M_s)\Big)
+   \]
+   \[
+   S^* = \arg\min_{s \in [0, 63]} d(s)
+   \]
+   임의의 매직 넘버나 Threshold 없이 순수 $\arg\min$ 최소 거리로 최적 파티션을 확정한다.
+
+### 13.2 3-서브셋 파티션 추정기 (`EstimateBC7Partition3Subsets`)
+
+Mode 0 (16개 셰이프) 및 Mode 2 (64개 셰이프)를 위해, 주축 투영 값을 3분위(Tertile)로 분할하여 최적 셰이프를 결정한다:
+1. 투영 범위 $\Delta = p_{\max} - p_{\min}$를 3등분하여 각 텍셀에 이상적인 레이블 $L_t \in \{0, 1, 2\}$ 할당.
+2. 텍셀 0은 하드웨어상 항상 서브셋 0이므로, $L_0 = 0$이 되도록 레이블 정규화.
+3. 서브셋 1과 2의 치환(Permutation) 불변성을 고려하여 64개 셰이프와의 최대 일치도($\arg\max$) 계산:
+   \[
+   \text{match}(s) = \max\Big(\sum [g\_bc7PartitionTable3Subsets[s][t] == L_t], \; \sum [g\_bc7PartitionTable3Subsets[s][t] == \text{swap}_{1,2}(L_t)]\Big)
+   \]
+   - Mode 0 최적 셰이프: $S_{3, M0}^* = \arg\max_{s \in [0, 15]} \text{match}(s)$
+   - Mode 2 최적 셰이프: $S_{3, M2}^* = \arg\max_{s \in [0, 63]} \text{match}(s)$
+
+## 14. 무(無)Threshold Rate-Distortion 모드 선택기
+
+### 14.1 불투명 블록 5대 모드 완전경쟁 ($\min(E_0, E_1, E_2, E_3, E_6)$)
+
+1. **Mode 6 피팅 (1-subset, 4-bit)**:
+   - 1개 선분, RGBA 7777 + P-bit, 4-bit index (16단계 팔레트)
+   - 복원 왜곡 오차: $E_6 = \sum_{t=0}^{15} \|C_t - \hat{C}_t^{(6)}\|^2$
+2. **Mode 1 피팅 (2-subsets, 3-bit)**:
+   - FasTC 추출 파티션 $S_2^*$, RGB 666 + 2 P-bits, 3-bit index (8단계 팔레트)
+   - 복원 왜곡 오차: $E_1 = \sum_{t=0}^{15} \|C_t - \hat{C}_t^{(1)}\|^2$
+3. **Mode 3 피팅 (2-subsets, 2-bit, 고정밀 7-bit 엔드포인트)**:
+   - 동일 파티션 $S_2^*$ 공유, RGB 777 + 4 P-bits, 2-bit index (4단계 팔레트)
+   - 복원 왜곡 오차: $E_3 = \sum_{t=0}^{15} \|C_t - \hat{C}_t^{(3)}\|^2$
+4. **Mode 0 피팅 (3-subsets, 3-bit, 4-bit 엔드포인트 + 6 P-bits)**:
+   - FasTC 추출 파티션 $S_{3, M0}^*$, RGB 444 + 6 P-bits, 3-bit index (8단계 팔레트)
+   - 복원 왜곡 오차: $E_0 = \sum_{t=0}^{15} \|C_t - \hat{C}_t^{(0)}\|^2$
+5. **Mode 2 피팅 (3-subsets, 2-bit, 5-bit 엔드포인트)**:
+   - FasTC 추출 파티션 $S_{3, M2}^*$, RGB 555, 2-bit index (4단계 팔레트)
+   - 복원 왜곡 오차: $E_2 = \sum_{t=0}^{15} \|C_t - \hat{C}_t^{(2)}\|^2$
+6. **불투명 최종 결정**:
+   \[
+   \text{Winning Opaque Block} = \arg\min(E_0, E_1, E_2, E_3, E_6)
+   \]
+
+### 14.2 투명 블록 4대 모드 완전경쟁 ($\min(E_4, E_5, E_6, E_7)$)
+
+알파 채널 변화가 감지된 블록(`isOpaque == false`)은 4D RGBA 공간에서 4대 알파 모드가 직접 MSE 오차 대결을 펼친다:
+
+1. **Mode 6 피팅 (1-subset, 4-bit single index)**:
+   - 단일 4D 선분, RGBA 7777 + 2 P-bits, 4-bit index
+   - 복원 왜곡 오차: $E_6 = \sum_{t=0}^{15} \|C_t - \hat{C}_t^{(6)}\|^2$
+2. **Mode 7 피팅 (2-subsets, 2-bit single index)**:
+   - FasTC 2-서브셋 파티션 $S_2^*$ 공유, RGBA 5555 + 4 P-bits, 2-bit index
+   - 색상과 알파가 동시에 2개 영역으로 분할된 경계면 텍스처에서 최적 성능
+   - 복원 왜곡 오차: $E_7 = \sum_{t=0}^{15} \|C_t - \hat{C}_t^{(7)}\|^2$
+3. **Mode 4 피팅 (1-subset, 듀얼 인덱스: RGB 2b, Alpha 3b)**:
+   - RGB 555 (4단계 팔레트) + Alpha 6-bit (8단계 정밀 팔레트)
+   - 색상과 알파가 공간적으로 서로 다른 그래디언트를 가질 때 최적 분리 압축
+   - 복원 왜곡 오차: $E_4 = \sum_{t=0}^{15} \|C_t - \hat{C}_t^{(4)}\|^2$
+4. **Mode 5 피팅 (1-subset, 듀얼 인덱스: RGB 2b, Alpha 2b)**:
+   - RGB 777 (고정밀 색상) + Alpha 8-bit (풀 8비트 정밀 알파)
+   - 부드러운 고화질 색상과 독립적 알파를 동시에 복원
+   - 복원 왜곡 오차: $E_5 = \sum_{t=0}^{15} \|C_t - \hat{C}_t^{(5)}\|^2$
+5. **투명 최종 결정**:
+   \[
+   \text{Winning Transparent Block} = \arg\min(E_4, E_5, E_6, E_7)
+   \]
+
+이로써 BC7의 8개 전 모드가 임의의 Threshold 0% 상태에서 **순수 Rate-Distortion 물리적 오차 최소화 원칙**에 의해 완벽하게 자동 선택 및 인코딩된다.
+
+### 14.3 직관적 전담 함수: `FitAndStoreBC7ChildBlock`
+
+모드 선택 및 대상 메모리 저장을 단일 전담 함수로 캡슐화하여 유지보수성과 가독성을 극대화하였다:
+- **입력**: 대상 블록 포인터 `destinationBlock`, 자식 캔버스, FasTC 2S/3S 파티션 셰이프, Mode 6 후보 블록 및 오차, 불투명 여부 (`isOpaque`)
+- **처리**: Rate-Distortion 오차 대결을 거쳐 최저 오차를 달성한 우승 모드 결정 (`selectedMode`)
+- **출력**: 최저 왜곡 모드의 128비트 비트스트림을 `*destinationBlock`에 직접 기록하고, 결정된 `selectedMode` 번호를 반환
 
-(R1) 이면 $\rho$ LUT 를 팔레트 빌드와 함께 만들어야 하는데,
-그러면 팔레트 $D$ 도 이미 있는 셈이라 (R2) 와 거의 같아진다.
-실질적으로는 "팔레트를 만들되, 주 항은 심볼 내적으로 하고 $\rho$ 만 게더"가 된다.
-
-**잠정 판단: 레벨 1 은 (R2), 레벨 $\ge 2$ 는 순수 심볼.**
-
-이유: 레벨 1 은 16개 $y_j$ 전부를 필요로 하므로 어차피 게더가 불가피하다.
-레벨 $\ge 2$ 는 블록 평균 하나만 필요하므로 심볼이 압도적이다.
-
-이 구조는 BC1 과 정확히 대응한다 — BC1 도 mip 1 은 팔레트를 만들고(경로 A),
-mip 2 이상은 평균 이미지만 쓴다(경로 B). `docs/BC1.md` §3.1
-
-### D3. $\tilde B$ 를 int16 으로 유지할 것인가
-
-int16 이면 $\tilde B^\top g$ 가 정확한 정수 연산이 된다.
-
-$$
-64\,g \in \mathbb{Z},\quad E \in \mathbb{Z} \cap [0,255]
-\;\Longrightarrow\;
-\text{최대 } 256 \times 255 = 65{,}280 \;\to\; \text{int32 누산으로 충분}
-$$
-
-비트 일치 검증(§4.3)에 유리하다. **int16 권장.**
-
-### D4. 모드 4의 인덱스 선택자를 언팩 시점에 정규화할 것인가
-
-모드 4 는 선택자 비트로 "2-bit 세트가 색이냐 알파냐"가 바뀐다
-(`uIndexModeBits = 1`, `[코드]` `BC6HBC7.cpp:1116`).
-
-$\iota$ 함수에 넣어 런타임 분기로 둘 수도 있고,
-언팩 시 두 세트를 스왑해 항상 "세트0 = 색"으로 정규화할 수도 있다.
-
-**정규화 권장.** 이후 모든 코드에서 모드 4 가 모드 5 와 동일한 형태가 된다.
-§3.3 에서 회전을 흡수한 것과 같은 발상이다.
-
----
-
-## 10. 구현 순서
-
-서로 독립적으로 착수 가능한 덩어리가 셋이다. `[설계]`
-
-### ① 언팩 8모드 + 심볼 추출
-
-검증 기준은 §4.3 — "심볼 경로 재구성 = DirectXTex 디코드, **비트 동일**".
-여기가 모든 것의 전제다.
-
-모드는 쉬운 순서로 진행하는 것이 좋다.
-
-$$
-6 \;\to\; 5 \;\to\; 4 \;\to\; 1 \;\to\; 3 \;\to\; 7 \;\to\; 2 \;\to\; 0
-$$
-
-- 모드 6: $S=1$, p-bit 있음, 항등 언퀀타이즈, 인덱스 세트 1개 — 가장 단순
-- 모드 5: $S=1$, 인덱스 세트 2개, 회전 — 회전 흡수를 여기서 확립
-- 모드 4: 모드 5 + 인덱스 선택자 (D4 정규화 검증)
-- 모드 1: 첫 다중 subset + 공유 p-bit (D2 의 함정)
-- 모드 0: 3-subset + 4비트 엔드포인트 — 가장 복잡
-
-### ② 정리 S 구현
-
-언팩만 되면 **인코더 없이도** 레벨 $\ge 2$ 타깃을 만들 수 있다.
-재귀 경로와 dB 를 비교하면 **첫 번째 정량 성과**가 나온다. 난도 낮음.
-
-BC1 에서 대응하는 코드는 `ComputeChildBlockMoments` 의 `sourceMeans` 출력이다.
-`[코드]` `DirectXTexCompressedMips.cpp:613-671`
-
-### ③ 라벨장 적중률 측정
-
-역시 인코더가 필요 없다.
-심볼의 $n_{j,s}$ 에서 목표 라벨장 $\tau$ 를 만들고,
-정답은 $y_j$ 전수 최소제곱으로 구해 비교한다.
-
-**권고: ① 을 진행하면서 ②·③ 을 병렬로.**
-
----
-
-## 11. 미측정 항목
-
-이 문서에서 수치가 필요하지만 아직 없는 것들을 모아 둔다.
-
-| 항목 | 위치 | 왜 필요한가 |
-|---|---|---|
-| 스킵 경로 vs 재귀 경로의 dB 이득 | §6.5 | 정리 S 의 실질 가치. 레벨 4–6 에서 클 것으로 예상 |
-| SWAR 추출의 실제 명령 수 / 처리량 | §7.4 | BC1 대비 2–3배 추정치의 검증 |
-| (R0) 프루닝의 후보 통과율 | §5.1 | 2단 구조가 실제로 이득인지 |
-| 라벨장 상속 적중률 | §10 ③ | 파티션 후보를 얼마나 줄일 수 있는지 |
-| 모드별 언팩 비용 분포 | §4.2 | 분기 균일화(LUT 강제)가 실제로 이득인지 |
-| $\tilde B$ int16 vs float 정확도·속도 | D3 | 비트 일치 검증 가능 여부 |
-
-BC1 에서 이미 확립된 것과 대조하면 기대치를 잡을 수 있다.
-
-| BC1 실측 | 값 | BC7 기대 |
-|---|---|---|
-| 히스토그램 정확도 | 불일치 0 | 비트 동일 (더 강함) |
-| 공분산 정확도 | $4.7 \times 10^{-8}$ | 정수 산술이면 정확 |
-| E2E 속도향상 (DDS 입력) | 4.31× | BC7 은 인코딩이 훨씬 비싸므로 더 클 가능성 |
-| 밉 생성 커널 (4096², GPU) | 8.6–10.9 ms | 심볼 추출이 무거워 증가 예상 |
-
----
-
-## 부록 A. 기호표
-
-| 기호 | 의미 |
-|---|---|
-| $b$ | 소스 블록 인덱스 |
-| $r$ | 블록 내 텍셀 인덱스, $0 \le r \le 15$ |
-| $c$ | 채널, $c \in \{R,G,B,A\}$ |
-| $s = s_b(r)$ | 텍셀 $r$ 의 subset 라벨 |
-| $k = k_b(r,c)$ | 텍셀 $r$, 채널 $c$ 의 팔레트 인덱스 |
-| $S_b$ | 블록 $b$ 의 subset 수, $\in \{1,2,3\}$ |
-| $M_b = 2S_b$ | 엔드포인트 열 수, $\le 6$ |
-| $E_{i,s,c}$ | subset $s$ 의 엔드포인트 $i$, 채널 $c$ (언퀀타이즈된 8비트) |
-| $\tilde B_b$ | 엔드포인트 행렬 $\mathbb{Z}^{4 \times M_b}$ |
-| $W_k$ | 보간 가중치 정수, $\in [0,64]$ |
-| $w = W_k/64$ | 정규화 가중치 |
-| $\gamma_{b,r,c}$ | 텍셀 심볼 (2-희소 단체 벡터) |
-| $g_{j,c}$ | 쿼드 심볼 |
-| $\Gamma_b$ | 블록 심볼 $= \sum_r \gamma_r$ |
-| $n_{j,s}$ | 쿼드 $Q_j$ 에서 subset $s$ 인 텍셀 수 |
-| $\Sigma_{j,s}$ | 쿼드 $Q_j$ 에서 subset $s$ 의 정규화 가중치 합 |
-| $\rho_{s,k,c}$ | 팔레트 엔트리의 라운딩 오차, $\|\rho\| \le 1/2$ |
-| $\varrho_{j,c}$ | 쿼드 라운딩 합, $\|\varrho\| \le 2$ |
-| $\mu_b$ | 블록 평균 |
-| $P_\rho$ | 회전 치환행렬 |
-| $\iota(c)$ | 채널 $c$ 의 인덱스 세트 번호 |
-
-## 부록 B. 관련 문서
-
-- `docs/BC1.md` — 실제 구현된 BC1 알고리즘. 이 문서의 모든 대응 관계의 기준.
-- `DirectXTex/BC6HBC7.cpp` — BC7 인코더/디코더 레퍼런스. 모든 `[코드]` 근거.
-- `note.md` — 개발 노트.

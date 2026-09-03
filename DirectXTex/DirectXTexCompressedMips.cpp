@@ -4,6 +4,7 @@
 // Standard containers and allocation helpers used by the mean-image pyramid.
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <immintrin.h>
@@ -1425,6 +1426,11 @@ namespace // for bc1
 
 } // namespace for bc1
 
+namespace // for bc4
+{
+
+} // namespace for bc4
+
 namespace // for bc7 
 {
     constexpr uint8_t BC7_INVALID_MODE = 0xFF;
@@ -1482,6 +1488,26 @@ namespace // for bc7
         XMVECTOR word3;
     };
 
+    // Spatial fields needed to map every BC7 mode onto a common subset layout.
+    struct BC7ModeSpatialInfo
+    {
+        uint8_t subsetCount;
+        uint8_t partitionBitOffset;
+        uint8_t partitionBitCount;
+    };
+
+    constexpr BC7ModeSpatialInfo g_bc7ModeSpatialInfo[8] =
+    {
+        { 3, 1, 4 }, // Mode 0
+        { 2, 2, 6 }, // Mode 1
+        { 3, 3, 6 }, // Mode 2
+        { 2, 4, 6 }, // Mode 3
+        { 1, 0, 0 }, // Mode 4
+        { 1, 0, 0 }, // Mode 5
+        { 1, 0, 0 }, // Mode 6
+        { 2, 8, 6 }  // Mode 7
+    };
+
     // mode[modeIndex] contains 0xFFFFFFFF for matching lanes and zero otherwise.
     struct BC7ModeMaskBatch
     {
@@ -1502,11 +1528,19 @@ namespace // for bc7
         XMVECTOR value[2][4];
     };
 
-    // Endpoints for two-subset modes (Mode 1, Mode 7).
+    // Endpoints for multi-subset modes (up to 3 subsets: Mode 0, Mode 1, Mode 2, Mode 3, Mode 7).
     // value[subsetIndex][endpointIndex][channelIndex] (RGBA 8-bit integers).
-    struct BC7TwoSubsetEndpointBatch
+    struct BC7MultiSubsetEndpointBatch
     {
-        XMVECTOR value[2][2][4];
+        XMVECTOR value[3][2][4];
+    };
+    using BC7TwoSubsetEndpointBatch = BC7MultiSubsetEndpointBatch;
+
+    // Unpacked BC7 indices across four SIMD lanes.
+    // indices[texelIndex] contains one mode-specific palette index in each lane.
+    struct BC7IndexBatch
+    {
+        XMVECTOR indices[16];
     };
 
     // low stores texels 0-7 and high stores texels 8-15 as four-bit nibbles.
@@ -1522,13 +1556,7 @@ namespace // for bc7
         XMVECTOR value[4];
     };
 
-    // Mode 6 data reduced to an endpoint basis and four quadrant symbols.
-    struct BC7Mode6SymbolBatch
-    {
-        XMVECTOR activeMask;
-        BC7EndpointPairBatch endpoints;
-        BC7Mode6PackedIndexBatch indices;
-    };
+
 
     // value[quadrantIndex][channelIndex] stores one mean per BC7 block lane.
     struct BC7QuadrantMeanBatch
@@ -1572,6 +1600,17 @@ namespace // for bc7
         BC7BlockMeanBatch p10;
         BC7BlockMeanBatch p01;
         BC7BlockMeanBatch p11;
+    };
+
+    // Canonical intermediate representation (IR) of the downsampled child block.
+    // Contains the 16 child texels, block statistics, 4D principal axis, and opacity mask.
+    struct BC7ChildCanvas
+    {
+        XMVECTOR texels[16][4];              // 16 child texels (RGBA [0, 1] float in SIMD lanes)
+        BC7BlockMeanBatch mean;               // 4D block mean
+        BC7CovarianceMatrixBatch covariance;  // 4D ANOVA covariance matrix
+        BC7BlockMeanBatch axis;               // 4D principal axis from PCA power iteration
+        XMVECTOR isOpaque;                    // 0xFFFFFFFF if all 16 texels have alpha >= 254/255
     };
 
     // Scalar RGBA block mean used by the higher mip mean pyramid.
@@ -1672,10 +1711,106 @@ namespace // for bc7
         return XMVectorOrInt(ShiftLeft32<1>(val7), ShiftRight32<6>(val7));
     }
 
-    // Extract 6-bit partition shape index (0..63) for 2-subset modes (Mode 1, Mode 7).
-    inline XMVECTOR ExtractBC7Partition(const BC7BlockBatch& blocks, FXMVECTOR activeMask) noexcept
+    inline uint8_t UnquantizeBC7_6BitScalar(uint8_t value6, uint8_t pBit) noexcept
     {
-        return XMVectorAndInt(ExtractBC7Bits<2, 6>(blocks), activeMask);
+        const uint8_t val7 = static_cast<uint8_t>((value6 << 1) | (pBit & 1u));
+        return static_cast<uint8_t>((val7 << 1) | (val7 >> 6));
+    }
+
+    // Expand 5-bit channel with 1 P-bit to unquantized 8-bit integer (Mode 7).
+    // Exact Direct3D bit replication: (val6 << 2) | (val6 >> 4)
+    inline XMVECTOR UnquantizeBC7_5Bit(FXMVECTOR value5, FXMVECTOR pBit) noexcept
+    {
+        const XMVECTOR val6 = XMVectorOrInt(ShiftLeft32<1>(value5), pBit);
+        return XMVectorOrInt(ShiftLeft32<2>(val6), ShiftRight32<4>(val6));
+    }
+
+    inline uint8_t UnquantizeBC7_5BitScalar(uint8_t value5, uint8_t pBit) noexcept
+    {
+        const uint8_t val6 = static_cast<uint8_t>((value5 << 1) | (pBit & 1u));
+        return static_cast<uint8_t>((val6 << 2) | (val6 >> 4));
+    }
+
+    // Expand 4-bit channel with 1 P-bit to unquantized 8-bit integer (Mode 0).
+    // Exact Direct3D bit replication: (val5 << 3) | (val5 >> 2)
+    inline XMVECTOR UnquantizeBC7_4Bit(FXMVECTOR value4, FXMVECTOR pBit) noexcept
+    {
+        const XMVECTOR val5 = XMVectorOrInt(ShiftLeft32<1>(value4), pBit);
+        return XMVectorOrInt(ShiftLeft32<3>(val5), ShiftRight32<2>(val5));
+    }
+
+    inline uint8_t UnquantizeBC7_4BitScalar(uint8_t value4, uint8_t pBit) noexcept
+    {
+        const uint8_t val5 = static_cast<uint8_t>((value4 << 1) | (pBit & 1u));
+        return static_cast<uint8_t>((val5 << 3) | (val5 >> 2));
+    }
+
+    // Expand 5-bit channel without P-bit to unquantized 8-bit integer (Mode 2).
+    // Exact Direct3D bit replication: (val5 << 3) | (val5 >> 2)
+    inline XMVECTOR UnquantizeBC7_5Bit_NoPBit(FXMVECTOR value5) noexcept
+    {
+        return XMVectorOrInt(ShiftLeft32<3>(value5), ShiftRight32<2>(value5));
+    }
+
+    inline uint8_t UnquantizeBC7_5Bit_NoPBitScalar(uint8_t value5) noexcept
+    {
+        return static_cast<uint8_t>((value5 << 3) | (value5 >> 2));
+    }
+
+    // Expand 7-bit channel with 1 P-bit to unquantized 8-bit integer (Mode 3).
+    // Exact Direct3D: (val7 << 1) | pBit
+    inline XMVECTOR UnquantizeBC7_7Bit(FXMVECTOR value7, FXMVECTOR pBit) noexcept
+    {
+        return XMVectorOrInt(ShiftLeft32<1>(value7), pBit);
+    }
+
+    inline uint8_t UnquantizeBC7_7BitScalar(uint8_t value7, uint8_t pBit) noexcept
+    {
+        return static_cast<uint8_t>((value7 << 1) | (pBit & 1u));
+    }
+
+    // Expand 6-bit channel without P-bit to unquantized 8-bit integer (Mode 4 alpha).
+    // Exact Direct3D bit replication: (val6 << 2) | (val6 >> 4)
+    inline XMVECTOR UnquantizeBC7_6Bit_NoPBit(FXMVECTOR value6) noexcept
+    {
+        return XMVectorOrInt(ShiftLeft32<2>(value6), ShiftRight32<4>(value6));
+    }
+
+    inline uint8_t UnquantizeBC7_6Bit_NoPBitScalar(uint8_t value6) noexcept
+    {
+        return static_cast<uint8_t>((value6 << 2) | (value6 >> 4));
+    }
+
+    // Expand 7-bit channel without P-bit to unquantized 8-bit integer (Mode 5 RGB).
+    // Exact Direct3D bit replication: (val7 << 1) | (val7 >> 6)
+    inline XMVECTOR UnquantizeBC7_7Bit_NoPBit(FXMVECTOR value7) noexcept
+    {
+        return XMVectorOrInt(ShiftLeft32<1>(value7), ShiftRight32<6>(value7));
+    }
+
+    inline uint8_t UnquantizeBC7_7Bit_NoPBitScalar(uint8_t value7) noexcept
+    {
+        return static_cast<uint8_t>((value7 << 1) | (value7 >> 6));
+    }
+
+    // Extract the partition index for one BC7 mode from four block lanes.
+    inline XMVECTOR ExtractBC7Partition(
+        const BC7BlockBatch& blocks,
+        uint8_t mode,
+        FXMVECTOR activeMask) noexcept
+    {
+        assert(mode < 8);
+
+        const BC7ModeSpatialInfo& info = g_bc7ModeSpatialInfo[mode];
+        if (info.partitionBitCount == 0)
+        {
+            return XMVectorZero();
+        }
+
+        const __m128i shift = _mm_cvtsi32_si128(info.partitionBitOffset);
+        const XMVECTOR shifted = _mm_castsi128_ps(_mm_srl_epi32(_mm_castps_si128(blocks.word0), shift));
+        const uint32_t valueMask = (1u << info.partitionBitCount) - 1u;
+        return XMVectorAndInt(XMVectorAndInt(shifted, XMVectorReplicateInt(valueMask)), activeMask);
     }
 
     // Extract and expand Mode 1 endpoints to RGBA8 (RGB from 6-bit + shared P-bit, Alpha = 255).
@@ -1715,6 +1850,509 @@ namespace // for bc7
         return result;
     }
 
+    // Extract and expand Mode 7 endpoints to RGBA8.
+    inline BC7TwoSubsetEndpointBatch ExtractBC7Mode7Endpoints(const BC7BlockBatch& blocks, FXMVECTOR activeMask) noexcept
+    {
+        // Mode 7 stores one P-bit for each of its four endpoints.
+        const XMVECTOR pBit00 = ExtractBC7Bits<94, 1>(blocks);
+        const XMVECTOR pBit01 = ExtractBC7Bits<95, 1>(blocks);
+        const XMVECTOR pBit10 = ExtractBC7Bits<96, 1>(blocks);
+        const XMVECTOR pBit11 = ExtractBC7Bits<97, 1>(blocks);
+
+        BC7TwoSubsetEndpointBatch result{};
+
+        result.value[0][0][0] = XMVectorAndInt(UnquantizeBC7_5Bit(ExtractBC7Bits<14, 5>(blocks), pBit00), activeMask);
+        result.value[0][1][0] = XMVectorAndInt(UnquantizeBC7_5Bit(ExtractBC7Bits<19, 5>(blocks), pBit01), activeMask);
+        result.value[1][0][0] = XMVectorAndInt(UnquantizeBC7_5Bit(ExtractBC7Bits<24, 5>(blocks), pBit10), activeMask);
+        result.value[1][1][0] = XMVectorAndInt(UnquantizeBC7_5Bit(ExtractBC7Bits<29, 5>(blocks), pBit11), activeMask);
+
+        result.value[0][0][1] = XMVectorAndInt(UnquantizeBC7_5Bit(ExtractBC7Bits<34, 5>(blocks), pBit00), activeMask);
+        result.value[0][1][1] = XMVectorAndInt(UnquantizeBC7_5Bit(ExtractBC7Bits<39, 5>(blocks), pBit01), activeMask);
+        result.value[1][0][1] = XMVectorAndInt(UnquantizeBC7_5Bit(ExtractBC7Bits<44, 5>(blocks), pBit10), activeMask);
+        result.value[1][1][1] = XMVectorAndInt(UnquantizeBC7_5Bit(ExtractBC7Bits<49, 5>(blocks), pBit11), activeMask);
+
+        result.value[0][0][2] = XMVectorAndInt(UnquantizeBC7_5Bit(ExtractBC7Bits<54, 5>(blocks), pBit00), activeMask);
+        result.value[0][1][2] = XMVectorAndInt(UnquantizeBC7_5Bit(ExtractBC7Bits<59, 5>(blocks), pBit01), activeMask);
+        result.value[1][0][2] = XMVectorAndInt(UnquantizeBC7_5Bit(ExtractBC7Bits<64, 5>(blocks), pBit10), activeMask);
+        result.value[1][1][2] = XMVectorAndInt(UnquantizeBC7_5Bit(ExtractBC7Bits<69, 5>(blocks), pBit11), activeMask);
+
+        result.value[0][0][3] = XMVectorAndInt(UnquantizeBC7_5Bit(ExtractBC7Bits<74, 5>(blocks), pBit00), activeMask);
+        result.value[0][1][3] = XMVectorAndInt(UnquantizeBC7_5Bit(ExtractBC7Bits<79, 5>(blocks), pBit01), activeMask);
+        result.value[1][0][3] = XMVectorAndInt(UnquantizeBC7_5Bit(ExtractBC7Bits<84, 5>(blocks), pBit10), activeMask);
+        result.value[1][1][3] = XMVectorAndInt(UnquantizeBC7_5Bit(ExtractBC7Bits<89, 5>(blocks), pBit11), activeMask);
+
+        return result;
+    }
+
+    // Extract and expand Mode 0 endpoints to RGBA8 (3 subsets, RGB 444 + 6 unique P-bits, Alpha = 255).
+    inline BC7MultiSubsetEndpointBatch ExtractBC7Mode0Endpoints(const BC7BlockBatch& blocks, FXMVECTOR activeMask) noexcept
+    {
+        const XMVECTOR p0 = ExtractBC7Bits<77, 1>(blocks);
+        const XMVECTOR p1 = ExtractBC7Bits<78, 1>(blocks);
+        const XMVECTOR p2 = ExtractBC7Bits<79, 1>(blocks);
+        const XMVECTOR p3 = ExtractBC7Bits<80, 1>(blocks);
+        const XMVECTOR p4 = ExtractBC7Bits<81, 1>(blocks);
+        const XMVECTOR p5 = ExtractBC7Bits<82, 1>(blocks);
+        const XMVECTOR alpha255 = XMVectorReplicateInt(255u);
+
+        BC7MultiSubsetEndpointBatch result{};
+
+        // Red (bits 5..28)
+        result.value[0][0][0] = XMVectorAndInt(UnquantizeBC7_4Bit(ExtractBC7Bits<5, 4>(blocks), p0), activeMask);
+        result.value[0][1][0] = XMVectorAndInt(UnquantizeBC7_4Bit(ExtractBC7Bits<9, 4>(blocks), p1), activeMask);
+        result.value[1][0][0] = XMVectorAndInt(UnquantizeBC7_4Bit(ExtractBC7Bits<13, 4>(blocks), p2), activeMask);
+        result.value[1][1][0] = XMVectorAndInt(UnquantizeBC7_4Bit(ExtractBC7Bits<17, 4>(blocks), p3), activeMask);
+        result.value[2][0][0] = XMVectorAndInt(UnquantizeBC7_4Bit(ExtractBC7Bits<21, 4>(blocks), p4), activeMask);
+        result.value[2][1][0] = XMVectorAndInt(UnquantizeBC7_4Bit(ExtractBC7Bits<25, 4>(blocks), p5), activeMask);
+
+        // Green (bits 29..52)
+        result.value[0][0][1] = XMVectorAndInt(UnquantizeBC7_4Bit(ExtractBC7Bits<29, 4>(blocks), p0), activeMask);
+        result.value[0][1][1] = XMVectorAndInt(UnquantizeBC7_4Bit(ExtractBC7Bits<33, 4>(blocks), p1), activeMask);
+        result.value[1][0][1] = XMVectorAndInt(UnquantizeBC7_4Bit(ExtractBC7Bits<37, 4>(blocks), p2), activeMask);
+        result.value[1][1][1] = XMVectorAndInt(UnquantizeBC7_4Bit(ExtractBC7Bits<41, 4>(blocks), p3), activeMask);
+        result.value[2][0][1] = XMVectorAndInt(UnquantizeBC7_4Bit(ExtractBC7Bits<45, 4>(blocks), p4), activeMask);
+        result.value[2][1][1] = XMVectorAndInt(UnquantizeBC7_4Bit(ExtractBC7Bits<49, 4>(blocks), p5), activeMask);
+
+        // Blue (bits 53..76)
+        result.value[0][0][2] = XMVectorAndInt(UnquantizeBC7_4Bit(ExtractBC7Bits<53, 4>(blocks), p0), activeMask);
+        result.value[0][1][2] = XMVectorAndInt(UnquantizeBC7_4Bit(ExtractBC7Bits<57, 4>(blocks), p1), activeMask);
+        result.value[1][0][2] = XMVectorAndInt(UnquantizeBC7_4Bit(ExtractBC7Bits<61, 4>(blocks), p2), activeMask);
+        result.value[1][1][2] = XMVectorAndInt(UnquantizeBC7_4Bit(ExtractBC7Bits<65, 4>(blocks), p3), activeMask);
+        result.value[2][0][2] = XMVectorAndInt(UnquantizeBC7_4Bit(ExtractBC7Bits<69, 4>(blocks), p4), activeMask);
+        result.value[2][1][2] = XMVectorAndInt(UnquantizeBC7_4Bit(ExtractBC7Bits<73, 4>(blocks), p5), activeMask);
+
+        // Alpha = 255
+        for (size_t s = 0; s < 3; ++s)
+        {
+            result.value[s][0][3] = XMVectorAndInt(alpha255, activeMask);
+            result.value[s][1][3] = XMVectorAndInt(alpha255, activeMask);
+        }
+
+        return result;
+    }
+
+    // Extract and expand Mode 2 endpoints to RGBA8 (3 subsets, RGB 555 without P-bits, Alpha = 255).
+    inline BC7MultiSubsetEndpointBatch ExtractBC7Mode2Endpoints(const BC7BlockBatch& blocks, FXMVECTOR activeMask) noexcept
+    {
+        const XMVECTOR alpha255 = XMVectorReplicateInt(255u);
+        BC7MultiSubsetEndpointBatch result{};
+
+        // Red (bits 9..38)
+        result.value[0][0][0] = XMVectorAndInt(UnquantizeBC7_5Bit_NoPBit(ExtractBC7Bits<9, 5>(blocks)), activeMask);
+        result.value[0][1][0] = XMVectorAndInt(UnquantizeBC7_5Bit_NoPBit(ExtractBC7Bits<14, 5>(blocks)), activeMask);
+        result.value[1][0][0] = XMVectorAndInt(UnquantizeBC7_5Bit_NoPBit(ExtractBC7Bits<19, 5>(blocks)), activeMask);
+        result.value[1][1][0] = XMVectorAndInt(UnquantizeBC7_5Bit_NoPBit(ExtractBC7Bits<24, 5>(blocks)), activeMask);
+        result.value[2][0][0] = XMVectorAndInt(UnquantizeBC7_5Bit_NoPBit(ExtractBC7Bits<29, 5>(blocks)), activeMask);
+        result.value[2][1][0] = XMVectorAndInt(UnquantizeBC7_5Bit_NoPBit(ExtractBC7Bits<34, 5>(blocks)), activeMask);
+
+        // Green (bits 39..68)
+        result.value[0][0][1] = XMVectorAndInt(UnquantizeBC7_5Bit_NoPBit(ExtractBC7Bits<39, 5>(blocks)), activeMask);
+        result.value[0][1][1] = XMVectorAndInt(UnquantizeBC7_5Bit_NoPBit(ExtractBC7Bits<44, 5>(blocks)), activeMask);
+        result.value[1][0][1] = XMVectorAndInt(UnquantizeBC7_5Bit_NoPBit(ExtractBC7Bits<49, 5>(blocks)), activeMask);
+        result.value[1][1][1] = XMVectorAndInt(UnquantizeBC7_5Bit_NoPBit(ExtractBC7Bits<54, 5>(blocks)), activeMask);
+        result.value[2][0][1] = XMVectorAndInt(UnquantizeBC7_5Bit_NoPBit(ExtractBC7Bits<59, 5>(blocks)), activeMask);
+        result.value[2][1][1] = XMVectorAndInt(UnquantizeBC7_5Bit_NoPBit(ExtractBC7Bits<64, 5>(blocks)), activeMask);
+
+        // Blue (bits 69..98)
+        result.value[0][0][2] = XMVectorAndInt(UnquantizeBC7_5Bit_NoPBit(ExtractBC7Bits<69, 5>(blocks)), activeMask);
+        result.value[0][1][2] = XMVectorAndInt(UnquantizeBC7_5Bit_NoPBit(ExtractBC7Bits<74, 5>(blocks)), activeMask);
+        result.value[1][0][2] = XMVectorAndInt(UnquantizeBC7_5Bit_NoPBit(ExtractBC7Bits<79, 5>(blocks)), activeMask);
+        result.value[1][1][2] = XMVectorAndInt(UnquantizeBC7_5Bit_NoPBit(ExtractBC7Bits<84, 5>(blocks)), activeMask);
+        result.value[2][0][2] = XMVectorAndInt(UnquantizeBC7_5Bit_NoPBit(ExtractBC7Bits<89, 5>(blocks)), activeMask);
+        result.value[2][1][2] = XMVectorAndInt(UnquantizeBC7_5Bit_NoPBit(ExtractBC7Bits<94, 5>(blocks)), activeMask);
+
+        // Alpha = 255
+        for (size_t s = 0; s < 3; ++s)
+        {
+            result.value[s][0][3] = XMVectorAndInt(alpha255, activeMask);
+            result.value[s][1][3] = XMVectorAndInt(alpha255, activeMask);
+        }
+
+        return result;
+    }
+
+    // Extract and expand Mode 3 endpoints to RGBA8 (2 subsets, RGB 777 + 4 unique P-bits, Alpha = 255).
+    inline BC7MultiSubsetEndpointBatch ExtractBC7Mode3Endpoints(const BC7BlockBatch& blocks, FXMVECTOR activeMask) noexcept
+    {
+        const XMVECTOR p0 = ExtractBC7Bits<94, 1>(blocks);
+        const XMVECTOR p1 = ExtractBC7Bits<95, 1>(blocks);
+        const XMVECTOR p2 = ExtractBC7Bits<96, 1>(blocks);
+        const XMVECTOR p3 = ExtractBC7Bits<97, 1>(blocks);
+        const XMVECTOR alpha255 = XMVectorReplicateInt(255u);
+
+        BC7MultiSubsetEndpointBatch result{};
+
+        // Red (bits 10..37)
+        result.value[0][0][0] = XMVectorAndInt(UnquantizeBC7_7Bit(ExtractBC7Bits<10, 7>(blocks), p0), activeMask);
+        result.value[0][1][0] = XMVectorAndInt(UnquantizeBC7_7Bit(ExtractBC7Bits<17, 7>(blocks), p1), activeMask);
+        result.value[1][0][0] = XMVectorAndInt(UnquantizeBC7_7Bit(ExtractBC7Bits<24, 7>(blocks), p2), activeMask);
+        result.value[1][1][0] = XMVectorAndInt(UnquantizeBC7_7Bit(ExtractBC7Bits<31, 7>(blocks), p3), activeMask);
+
+        // Green (bits 38..65)
+        result.value[0][0][1] = XMVectorAndInt(UnquantizeBC7_7Bit(ExtractBC7Bits<38, 7>(blocks), p0), activeMask);
+        result.value[0][1][1] = XMVectorAndInt(UnquantizeBC7_7Bit(ExtractBC7Bits<45, 7>(blocks), p1), activeMask);
+        result.value[1][0][1] = XMVectorAndInt(UnquantizeBC7_7Bit(ExtractBC7Bits<52, 7>(blocks), p2), activeMask);
+        result.value[1][1][1] = XMVectorAndInt(UnquantizeBC7_7Bit(ExtractBC7Bits<59, 7>(blocks), p3), activeMask);
+
+        // Blue (bits 66..93)
+        result.value[0][0][2] = XMVectorAndInt(UnquantizeBC7_7Bit(ExtractBC7Bits<66, 7>(blocks), p0), activeMask);
+        result.value[0][1][2] = XMVectorAndInt(UnquantizeBC7_7Bit(ExtractBC7Bits<73, 7>(blocks), p1), activeMask);
+        result.value[1][0][2] = XMVectorAndInt(UnquantizeBC7_7Bit(ExtractBC7Bits<80, 7>(blocks), p2), activeMask);
+        result.value[1][1][2] = XMVectorAndInt(UnquantizeBC7_7Bit(ExtractBC7Bits<87, 7>(blocks), p3), activeMask);
+
+        // Alpha = 255
+        result.value[0][0][3] = XMVectorAndInt(alpha255, activeMask);
+        result.value[0][1][3] = XMVectorAndInt(alpha255, activeMask);
+        result.value[1][0][3] = XMVectorAndInt(alpha255, activeMask);
+        result.value[1][1][3] = XMVectorAndInt(alpha255, activeMask);
+
+        return result;
+    }
+
+    // Extract and expand Mode 4 endpoints to RGBA8 (1 subset, RGB 555, A 6, no P-bits).
+    inline BC7EndpointPairBatch ExtractBC7Mode4Endpoints(const BC7BlockBatch& blocks, FXMVECTOR activeMask) noexcept
+    {
+        BC7EndpointPairBatch result{};
+
+        // Red (bits 8..17)
+        result.value[0][0] = XMVectorAndInt(UnquantizeBC7_5Bit_NoPBit(ExtractBC7Bits<8, 5>(blocks)), activeMask);
+        result.value[1][0] = XMVectorAndInt(UnquantizeBC7_5Bit_NoPBit(ExtractBC7Bits<13, 5>(blocks)), activeMask);
+
+        // Green (bits 18..27)
+        result.value[0][1] = XMVectorAndInt(UnquantizeBC7_5Bit_NoPBit(ExtractBC7Bits<18, 5>(blocks)), activeMask);
+        result.value[1][1] = XMVectorAndInt(UnquantizeBC7_5Bit_NoPBit(ExtractBC7Bits<23, 5>(blocks)), activeMask);
+
+        // Blue (bits 28..37)
+        result.value[0][2] = XMVectorAndInt(UnquantizeBC7_5Bit_NoPBit(ExtractBC7Bits<28, 5>(blocks)), activeMask);
+        result.value[1][2] = XMVectorAndInt(UnquantizeBC7_5Bit_NoPBit(ExtractBC7Bits<33, 5>(blocks)), activeMask);
+
+        // Alpha (bits 38..49)
+        result.value[0][3] = XMVectorAndInt(UnquantizeBC7_6Bit_NoPBit(ExtractBC7Bits<38, 6>(blocks)), activeMask);
+        result.value[1][3] = XMVectorAndInt(UnquantizeBC7_6Bit_NoPBit(ExtractBC7Bits<44, 6>(blocks)), activeMask);
+
+        return result;
+    }
+
+    // Extract and expand Mode 5 endpoints to RGBA8 (1 subset, RGB 777, A 8, no P-bits).
+    inline BC7EndpointPairBatch ExtractBC7Mode5Endpoints(const BC7BlockBatch& blocks, FXMVECTOR activeMask) noexcept
+    {
+        BC7EndpointPairBatch result{};
+
+        // Red (bits 8..21)
+        result.value[0][0] = XMVectorAndInt(UnquantizeBC7_7Bit_NoPBit(ExtractBC7Bits<8, 7>(blocks)), activeMask);
+        result.value[1][0] = XMVectorAndInt(UnquantizeBC7_7Bit_NoPBit(ExtractBC7Bits<15, 7>(blocks)), activeMask);
+
+        // Green (bits 22..35)
+        result.value[0][1] = XMVectorAndInt(UnquantizeBC7_7Bit_NoPBit(ExtractBC7Bits<22, 7>(blocks)), activeMask);
+        result.value[1][1] = XMVectorAndInt(UnquantizeBC7_7Bit_NoPBit(ExtractBC7Bits<29, 7>(blocks)), activeMask);
+
+        // Blue (bits 36..49)
+        result.value[0][2] = XMVectorAndInt(UnquantizeBC7_7Bit_NoPBit(ExtractBC7Bits<36, 7>(blocks)), activeMask);
+        result.value[1][2] = XMVectorAndInt(UnquantizeBC7_7Bit_NoPBit(ExtractBC7Bits<43, 7>(blocks)), activeMask);
+
+        // Alpha (bits 50..65)
+        result.value[0][3] = XMVectorAndInt(ExtractBC7Bits<50, 8>(blocks), activeMask);
+        result.value[1][3] = XMVectorAndInt(ExtractBC7Bits<58, 8>(blocks), activeMask);
+
+        return result;
+    }
+
+    // 2-Subset Partition Set (64 shapes x 16 texels)
+    constexpr uint8_t g_bc7PartitionTable2Subsets[64][16] =
+    {
+        { 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1 }, // Shape 0
+        { 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1 }, // Shape 1
+        { 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1 }, // Shape 2
+        { 0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 1, 1, 1 }, // Shape 3
+        { 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 1, 1 }, // Shape 4
+        { 0, 0, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1 }, // Shape 5
+        { 0, 0, 0, 1, 0, 0, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1 }, // Shape 6
+        { 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 1, 0, 1, 1, 1 }, // Shape 7
+        { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 1 }, // Shape 8
+        { 0, 0, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 }, // Shape 9
+        { 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 1, 1, 1, 1, 1, 1 }, // Shape 10
+        { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 1, 1 }, // Shape 11
+        { 0, 0, 0, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 }, // Shape 12
+        { 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1 }, // Shape 13
+        { 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 }, // Shape 14
+        { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1 }, // Shape 15
+        { 0, 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 0, 1, 1, 1, 1 }, // Shape 16
+        { 0, 1, 1, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0 }, // Shape 17
+        { 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 0 }, // Shape 18
+        { 0, 1, 1, 1, 0, 0, 1, 1, 0, 0, 0, 1, 0, 0, 0, 0 }, // Shape 19
+        { 0, 0, 1, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0 }, // Shape 20
+        { 0, 0, 0, 0, 1, 0, 0, 0, 1, 1, 0, 0, 1, 1, 1, 0 }, // Shape 21
+        { 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 1, 0, 0 }, // Shape 22
+        { 0, 1, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 0, 1 }, // Shape 23
+        { 0, 0, 1, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0 }, // Shape 24
+        { 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 1, 0, 0 }, // Shape 25
+        { 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0 }, // Shape 26
+        { 0, 0, 1, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1, 1, 0, 0 }, // Shape 27
+        { 0, 0, 0, 1, 0, 1, 1, 1, 1, 1, 1, 0, 1, 0, 0, 0 }, // Shape 28
+        { 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0 }, // Shape 29
+        { 0, 1, 1, 1, 0, 0, 0, 1, 1, 0, 0, 0, 1, 1, 1, 0 }, // Shape 30
+        { 0, 0, 1, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 1, 0, 0 }, // Shape 31
+        { 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1 }, // Shape 32
+        { 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1 }, // Shape 33
+        { 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0 }, // Shape 34
+        { 0, 0, 1, 1, 0, 0, 1, 1, 1, 1, 0, 0, 1, 1, 0, 0 }, // Shape 35
+        { 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0 }, // Shape 36
+        { 0, 1, 0, 1, 0, 1, 0, 1, 1, 0, 1, 0, 1, 0, 1, 0 }, // Shape 37
+        { 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1 }, // Shape 38
+        { 0, 1, 0, 1, 1, 0, 1, 0, 1, 0, 1, 0, 0, 1, 0, 1 }, // Shape 39
+        { 0, 1, 1, 1, 0, 0, 1, 1, 1, 1, 0, 0, 1, 1, 1, 0 }, // Shape 40
+        { 0, 0, 0, 1, 0, 0, 1, 1, 1, 1, 0, 0, 1, 0, 0, 0 }, // Shape 41
+        { 0, 0, 1, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 1, 0, 0 }, // Shape 42
+        { 0, 0, 1, 1, 1, 0, 1, 1, 1, 1, 0, 1, 1, 1, 0, 0 }, // Shape 43
+        { 0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0 }, // Shape 44
+        { 0, 0, 1, 1, 1, 1, 0, 0, 1, 1, 0, 0, 0, 0, 1, 1 }, // Shape 45
+        { 0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1 }, // Shape 46
+        { 0, 0, 0, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 0, 0, 0 }, // Shape 47
+        { 0, 1, 0, 0, 1, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0 }, // Shape 48
+        { 0, 0, 1, 0, 0, 1, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0 }, // Shape 49
+        { 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 1, 1, 0, 0, 1, 0 }, // Shape 50
+        { 0, 0, 0, 0, 0, 1, 0, 0, 1, 1, 1, 0, 0, 1, 0, 0 }, // Shape 51
+        { 0, 1, 1, 0, 1, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 1 }, // Shape 52
+        { 0, 0, 1, 1, 0, 1, 1, 0, 1, 1, 0, 0, 1, 0, 0, 1 }, // Shape 53
+        { 0, 1, 1, 0, 0, 0, 1, 1, 1, 0, 0, 1, 1, 1, 0, 0 }, // Shape 54
+        { 0, 0, 1, 1, 1, 0, 0, 1, 1, 1, 0, 0, 0, 1, 1, 0 }, // Shape 55
+        { 0, 1, 1, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 0, 0, 1 }, // Shape 56
+        { 0, 1, 1, 0, 0, 0, 1, 1, 0, 0, 1, 1, 1, 0, 0, 1 }, // Shape 57
+        { 0, 1, 1, 1, 1, 1, 1, 0, 1, 0, 0, 0, 0, 0, 0, 1 }, // Shape 58
+        { 0, 0, 0, 1, 1, 0, 0, 0, 1, 1, 1, 0, 0, 1, 1, 1 }, // Shape 59
+        { 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1 }, // Shape 60
+        { 0, 0, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0 }, // Shape 61
+        { 0, 0, 1, 0, 0, 0, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0 }, // Shape 62
+        { 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 0, 1, 1, 1 }  // Shape 63
+    };
+
+    // BC7 partition set for three subsets. Mode 0 uses shapes 0..15;
+    // Mode 2 uses the complete set of 64 shapes.
+    constexpr uint8_t g_bc7PartitionTable3Subsets[64][16] =
+    {
+        { 0, 0, 1, 1, 0, 0, 1, 1, 0, 2, 2, 1, 2, 2, 2, 2 },
+        { 0, 0, 0, 1, 0, 0, 1, 1, 2, 2, 1, 1, 2, 2, 2, 1 },
+        { 0, 0, 0, 0, 2, 0, 0, 1, 2, 2, 1, 1, 2, 2, 1, 1 },
+        { 0, 2, 2, 2, 0, 0, 2, 2, 0, 0, 1, 1, 0, 1, 1, 1 },
+        { 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 2, 2, 1, 1, 2, 2 },
+        { 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 2, 2, 0, 0, 2, 2 },
+        { 0, 0, 2, 2, 0, 0, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1 },
+        { 0, 0, 1, 1, 0, 0, 1, 1, 2, 2, 1, 1, 2, 2, 1, 1 },
+        { 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2 },
+        { 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2 },
+        { 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2 },
+        { 0, 0, 1, 2, 0, 0, 1, 2, 0, 0, 1, 2, 0, 0, 1, 2 },
+        { 0, 1, 1, 2, 0, 1, 1, 2, 0, 1, 1, 2, 0, 1, 1, 2 },
+        { 0, 1, 2, 2, 0, 1, 2, 2, 0, 1, 2, 2, 0, 1, 2, 2 },
+        { 0, 0, 1, 1, 0, 1, 1, 2, 1, 1, 2, 2, 1, 2, 2, 2 },
+        { 0, 0, 1, 1, 2, 0, 0, 1, 2, 2, 0, 0, 2, 2, 2, 0 },
+        { 0, 0, 0, 1, 0, 0, 1, 1, 0, 1, 1, 2, 1, 1, 2, 2 },
+        { 0, 1, 1, 1, 0, 0, 1, 1, 2, 0, 0, 1, 2, 2, 0, 0 },
+        { 0, 0, 0, 0, 1, 1, 2, 2, 1, 1, 2, 2, 1, 1, 2, 2 },
+        { 0, 0, 2, 2, 0, 0, 2, 2, 0, 0, 2, 2, 1, 1, 1, 1 },
+        { 0, 1, 1, 1, 0, 1, 1, 1, 0, 2, 2, 2, 0, 2, 2, 2 },
+        { 0, 0, 0, 1, 0, 0, 0, 1, 2, 2, 2, 1, 2, 2, 2, 1 },
+        { 0, 0, 0, 0, 0, 0, 1, 1, 0, 1, 2, 2, 0, 1, 2, 2 },
+        { 0, 0, 0, 0, 1, 1, 0, 0, 2, 2, 1, 0, 2, 2, 1, 0 },
+        { 0, 1, 2, 2, 0, 1, 2, 2, 0, 0, 1, 1, 0, 0, 0, 0 },
+        { 0, 0, 1, 2, 0, 0, 1, 2, 1, 1, 2, 2, 2, 2, 2, 2 },
+        { 0, 1, 1, 0, 1, 2, 2, 1, 1, 2, 2, 1, 0, 1, 1, 0 },
+        { 0, 0, 0, 0, 0, 1, 1, 0, 1, 2, 2, 1, 1, 2, 2, 1 },
+        { 0, 0, 2, 2, 1, 1, 0, 2, 1, 1, 0, 2, 0, 0, 2, 2 },
+        { 0, 1, 1, 0, 0, 1, 1, 0, 2, 0, 0, 2, 2, 2, 2, 2 },
+        { 0, 0, 1, 1, 0, 1, 2, 2, 0, 1, 2, 2, 0, 0, 1, 1 },
+        { 0, 0, 0, 0, 2, 0, 0, 0, 2, 2, 1, 1, 2, 2, 2, 1 },
+        { 0, 0, 0, 0, 0, 0, 0, 2, 1, 1, 2, 2, 1, 2, 2, 2 },
+        { 0, 2, 2, 2, 0, 0, 2, 2, 0, 0, 1, 2, 0, 0, 1, 1 },
+        { 0, 0, 1, 1, 0, 0, 1, 2, 0, 0, 2, 2, 0, 2, 2, 2 },
+        { 0, 1, 2, 0, 0, 1, 2, 0, 0, 1, 2, 0, 0, 1, 2, 0 },
+        { 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 0, 0, 0, 0 },
+        { 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0 },
+        { 0, 1, 2, 0, 2, 0, 1, 2, 1, 2, 0, 1, 0, 1, 2, 0 },
+        { 0, 0, 1, 1, 2, 2, 0, 0, 1, 1, 2, 2, 0, 0, 1, 1 },
+        { 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 0, 0, 0, 0, 1, 1 },
+        { 0, 1, 0, 1, 0, 1, 0, 1, 2, 2, 2, 2, 2, 2, 2, 2 },
+        { 0, 0, 0, 0, 0, 0, 0, 0, 2, 1, 2, 1, 2, 1, 2, 1 },
+        { 0, 0, 2, 2, 1, 1, 2, 2, 0, 0, 2, 2, 1, 1, 2, 2 },
+        { 0, 0, 2, 2, 0, 0, 1, 1, 0, 0, 2, 2, 0, 0, 1, 1 },
+        { 0, 2, 2, 0, 1, 2, 2, 1, 0, 2, 2, 0, 1, 2, 2, 1 },
+        { 0, 1, 0, 1, 2, 2, 2, 2, 2, 2, 2, 2, 0, 1, 0, 1 },
+        { 0, 0, 0, 0, 2, 1, 2, 1, 2, 1, 2, 1, 2, 1, 2, 1 },
+        { 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 2, 2, 2, 2 },
+        { 0, 2, 2, 2, 0, 1, 1, 1, 0, 2, 2, 2, 0, 1, 1, 1 },
+        { 0, 0, 0, 2, 1, 1, 1, 2, 0, 0, 0, 2, 1, 1, 1, 2 },
+        { 0, 0, 0, 0, 2, 1, 1, 2, 2, 1, 1, 2, 2, 1, 1, 2 },
+        { 0, 2, 2, 2, 0, 1, 1, 1, 0, 1, 1, 1, 0, 2, 2, 2 },
+        { 0, 0, 0, 2, 1, 1, 1, 2, 1, 1, 1, 2, 0, 0, 0, 2 },
+        { 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 2, 2, 2, 2 },
+        { 0, 0, 0, 0, 0, 0, 0, 0, 2, 1, 1, 2, 2, 1, 1, 2 },
+        { 0, 1, 1, 0, 0, 1, 1, 0, 2, 2, 2, 2, 2, 2, 2, 2 },
+        { 0, 0, 2, 2, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 2, 2 },
+        { 0, 0, 2, 2, 1, 1, 2, 2, 1, 1, 2, 2, 0, 0, 2, 2 },
+        { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 1, 1, 2 },
+        { 0, 0, 0, 2, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 1 },
+        { 0, 2, 2, 2, 1, 2, 2, 2, 0, 2, 2, 2, 1, 2, 2, 2 },
+        { 0, 1, 0, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2 },
+        { 0, 1, 1, 1, 2, 0, 1, 1, 2, 2, 0, 1, 2, 2, 2, 0 }
+    };
+
+    // Fixup index for Subset 1 (Subset 0 fixup is always 0)
+    constexpr uint8_t g_bc7FixUp2Subsets[64] =
+    {
+        15, 15, 15, 15,  15, 15, 15, 15,  15, 15, 15, 15,  15, 15, 15, 15,
+        15,  2,  8,  2,   2,  8,  8, 15,   2,  8,  2,  2,   8,  8,  2,  2,
+        15, 15,  6,  8,   2,  8, 15, 15,   2,  8,  2,  2,   2, 15, 15,  6,
+         6,  2,  6,  8,  15, 15,  2,  2,  15, 15, 15, 15,  15,  2,  2, 15
+    };
+
+    // Anchor texels for subsets 1 and 2 of each three-subset partition.
+    constexpr uint8_t g_bc7FixUp3Subsets[64][2] =
+    {
+        { 3,15 }, { 3, 8 }, {15, 8 }, {15, 3 }, { 8,15 }, { 3,15 }, {15, 3 }, {15, 8 },
+        { 8,15 }, { 8,15 }, { 6,15 }, { 6,15 }, { 6,15 }, { 5,15 }, { 3,15 }, { 3, 8 },
+        { 3,15 }, { 3, 8 }, { 8,15 }, {15, 3 }, { 3,15 }, { 3, 8 }, { 6,15 }, {10, 8 },
+        { 5, 3 }, { 8,15 }, { 8, 6 }, { 6,10 }, { 8,15 }, { 5,15 }, {15,10 }, {15, 8 },
+        { 8,15 }, {15, 3 }, { 3,15 }, { 5,10 }, { 6,10 }, {10, 8 }, { 8, 9 }, {15,10 },
+        {15, 6 }, { 3,15 }, {15, 8 }, { 5,15 }, {15, 3 }, {15, 6 }, {15, 6 }, {15, 8 },
+        { 3,15 }, {15, 3 }, { 5,15 }, { 5,15 }, { 5,15 }, { 8,15 }, { 5,15 }, {10,15 },
+        { 5,15 }, {10,15 }, { 8,15 }, {13,15 }, {15, 3 }, {12,15 }, { 3,15 }, { 3, 8 }
+    };
+
+    // Common spatial representation shared by every BC7 mode.
+    struct BC7PartitionLayout
+    {
+        const uint8_t* subsetByTexel;
+        std::array<uint8_t, 3> anchorTexel;
+        size_t subsetCount;
+    };
+
+    inline BC7PartitionLayout GetBC7PartitionLayout(size_t subsetCount, size_t partition) noexcept
+    {
+        assert(subsetCount >= 1 && subsetCount <= 3);
+        assert(partition < 64);
+
+        static constexpr uint8_t singleSubset[16]{};
+
+        if (subsetCount == 1)
+        {
+            return { singleSubset, { 0, 0, 0 }, 1 };
+        }
+
+        if (subsetCount == 2)
+        {
+            return { g_bc7PartitionTable2Subsets[partition], { 0, g_bc7FixUp2Subsets[partition], 0 }, 2 };
+        }
+
+        return
+        {
+            g_bc7PartitionTable3Subsets[partition],
+            { 0, g_bc7FixUp3Subsets[partition][0], g_bc7FixUp3Subsets[partition][1] },
+            3
+        };
+    }
+
+    // Resolve the spatial subset layout for any BC7 mode.
+    inline BC7PartitionLayout GetBC7ModePartitionLayout(uint8_t mode, uint8_t partition) noexcept
+    {
+        assert(mode < 8);
+
+        const BC7ModeSpatialInfo& info = g_bc7ModeSpatialInfo[mode];
+        const size_t partitionCount = size_t(1) << info.partitionBitCount;
+        assert(partition < partitionCount);
+        (void)partitionCount;
+
+        return GetBC7PartitionLayout(info.subsetCount, partition);
+    }
+
+
+    // Extract one partitioned index stream while restoring each subset's omitted anchor MSB to zero.
+    inline BC7IndexBatch ExtractBC7PartitionedIndices(
+        const BC7BlockBatch& blocks,
+        FXMVECTOR partition,
+        uint8_t mode,
+        size_t firstIndexBit,
+        size_t indexBitCount,
+        FXMVECTOR activeMask) noexcept
+    {
+        assert(mode < 8);
+        assert(indexBitCount >= 2 && indexBitCount <= 4);
+
+        // Unswizzle the 4 block words so each lane can be read as a 16-byte block
+        alignas(16) uint32_t w0[4], w1[4], w2[4], w3[4], shapes[4];
+        _mm_store_si128(reinterpret_cast<__m128i*>(w0), _mm_castps_si128(blocks.word0));
+        _mm_store_si128(reinterpret_cast<__m128i*>(w1), _mm_castps_si128(blocks.word1));
+        _mm_store_si128(reinterpret_cast<__m128i*>(w2), _mm_castps_si128(blocks.word2));
+        _mm_store_si128(reinterpret_cast<__m128i*>(w3), _mm_castps_si128(blocks.word3));
+        _mm_store_si128(reinterpret_cast<__m128i*>(shapes), _mm_castps_si128(partition));
+
+        uint32_t unpackedIndices[16][4]{};
+
+        for (size_t lane = 0; lane < 4; ++lane)
+        {
+            const uint32_t raw[4] = { w0[lane], w1[lane], w2[lane], w3[lane] };
+            const auto* blockBytes = reinterpret_cast<const uint8_t*>(raw);
+            const uint8_t shape = static_cast<uint8_t>(shapes[lane] & 0x3Fu);
+            const BC7PartitionLayout layout = GetBC7ModePartitionLayout(mode, shape);
+
+            size_t bitOffset = firstIndexBit;
+            for (size_t t = 0; t < 16; ++t)
+            {
+                const uint8_t subset = layout.subsetByTexel[t];
+                const size_t numBits = (t == layout.anchorTexel[subset]) ? indexBitCount - 1 : indexBitCount;
+                unpackedIndices[t][lane] = ReadBC7Bits(blockBytes, bitOffset, numBits);
+            }
+        }
+
+        BC7IndexBatch result{};
+        for (size_t t = 0; t < 16; ++t)
+        {
+            const XMVECTOR idx = _mm_castsi128_ps(_mm_load_si128(reinterpret_cast<const __m128i*>(unpackedIndices[t])));
+            result.indices[t] = XMVectorAndInt(idx, activeMask);
+        }
+
+        return result;
+    }
+
+    inline BC7IndexBatch ExtractBC7Mode0Indices(
+        const BC7BlockBatch& blocks,
+        FXMVECTOR partition,
+        FXMVECTOR activeMask) noexcept
+    {
+        return ExtractBC7PartitionedIndices(blocks, partition, 0, 83, 3, activeMask);
+    }
+
+    inline BC7IndexBatch ExtractBC7Mode1Indices(
+        const BC7BlockBatch& blocks,
+        FXMVECTOR partition,
+        FXMVECTOR activeMask) noexcept
+    {
+        return ExtractBC7PartitionedIndices(blocks, partition, 1, 82, 3, activeMask);
+    }
+
+    inline BC7IndexBatch ExtractBC7Mode2Indices(
+        const BC7BlockBatch& blocks,
+        FXMVECTOR partition,
+        FXMVECTOR activeMask) noexcept
+    {
+        return ExtractBC7PartitionedIndices(blocks, partition, 2, 99, 2, activeMask);
+    }
+
+    inline BC7IndexBatch ExtractBC7Mode3Indices(
+        const BC7BlockBatch& blocks,
+        FXMVECTOR partition,
+        FXMVECTOR activeMask) noexcept
+    {
+        return ExtractBC7PartitionedIndices(blocks, partition, 3, 98, 2, activeMask);
+    }
+
+    inline BC7IndexBatch ExtractBC7Mode7Indices(
+        const BC7BlockBatch& blocks,
+        FXMVECTOR partition,
+        FXMVECTOR activeMask) noexcept
+    {
+        return ExtractBC7PartitionedIndices(blocks, partition, 7, 98, 2, activeMask);
+    }
+
     template<size_t IndexBits>
     inline XMVECTOR LookupBC7Weight(FXMVECTOR indices) noexcept
     {
@@ -1728,16 +2366,24 @@ namespace // for bc7
         return _mm_castsi128_ps(_mm_shuffle_epi8(weights, _mm_castps_si128(indices)));
     }
 
+    // Build rounded BC7 palette values with per-lane vector weights.
+    inline XMVECTOR InterpolateBC7PaletteVector(FXMVECTOR endpoint0, FXMVECTOR endpoint1, FXMVECTOR weightFloat) noexcept
+    {
+        const XMVECTOR endpoint0Float = XMConvertVectorUIntToFloat(endpoint0, 0);
+        const XMVECTOR endpoint1Float = XMConvertVectorUIntToFloat(endpoint1, 0);
+        const XMVECTOR numerator = XMVectorMultiplyAdd(
+            XMVectorSubtract(endpoint1Float, endpoint0Float),
+            weightFloat,
+            XMVectorScale(endpoint0Float, 64.0f));
+        const XMVECTOR rounded = XMVectorTruncate(XMVectorScale(XMVectorAdd(numerator, XMVectorReplicate(32.0f)), 1.0f / 64.0f));
+        return XMConvertVectorFloatToUInt(rounded, 0);
+    }
+
     // Build one rounded BC7 palette value for four blocks at once.
     inline XMVECTOR InterpolateBC7PaletteValue(FXMVECTOR endpoint0, FXMVECTOR endpoint1, uint32_t weight) noexcept
     {
         assert(weight <= 64);
-
-        const XMVECTOR endpoint0Float = XMConvertVectorUIntToFloat(endpoint0, 0);
-        const XMVECTOR endpoint1Float = XMConvertVectorUIntToFloat(endpoint1, 0);
-        const XMVECTOR numerator = XMVectorMultiplyAdd(XMVectorSubtract(endpoint1Float, endpoint0Float), XMVectorReplicate(static_cast<float>(weight)), XMVectorScale(endpoint0Float, 64.0f));
-        const XMVECTOR rounded = XMVectorTruncate(XMVectorScale(XMVectorAdd(numerator, XMVectorReplicate(32.0f)), 1.0f / 64.0f));
-        return XMConvertVectorFloatToUInt(rounded, 0);
+        return InterpolateBC7PaletteVector(endpoint0, endpoint1, XMVectorReplicate(static_cast<float>(weight)));
     }
 
     template<size_t Texel>
@@ -1817,16 +2463,6 @@ namespace // for bc7
         return result;
     }
 
-    inline BC7Mode6SymbolBatch ExtractBC7Mode6Symbols(const BC7BlockBatch& blocks) noexcept
-    {
-        const BC7ModeMaskBatch modeMasks = GetBC7ModeMasks(blocks);
-
-        BC7Mode6SymbolBatch result{};
-        result.activeMask = modeMasks.mode[6];
-        result.endpoints = ExtractBC7Mode6Endpoints(blocks, result.activeMask);
-        result.indices = ExtractBC7Mode6PackedIndices(blocks, result.activeMask);
-        return result;
-    }
 
     // Compute the exact UNORM quadrant means using the BC7 hardware rounding rules.
     inline BC7QuadrantMeanBatch ComputeBC7Mode6QuadrantMeans(
@@ -1873,6 +2509,422 @@ namespace // for bc7
             for (size_t c = 0; c < 4; ++c)
             {
                 result.value[q][c] = XMVectorScale(result.value[q][c], colorScale);
+            }
+        }
+
+        return result;
+    }
+
+
+    // Compute exact UNORM quadrant means for partitioned multi-subset BC7 modes (Mode 0, 1, 2, 3, 7).
+    template<size_t IndexBits>
+    inline BC7QuadrantMeanBatch ComputeBC7MultiSubsetQuadrantMeans(
+        const BC7MultiSubsetEndpointBatch& endpoints,
+        FXMVECTOR partition,
+        const BC7IndexBatch& indices,
+        uint8_t mode,
+        FXMVECTOR activeMask) noexcept
+    {
+        static_assert(IndexBits == 2 || IndexBits == 3, "Invalid BC7 index precision");
+        assert(mode == 0 || mode == 1 || mode == 2 || mode == 3 || mode == 7);
+
+        constexpr float colorScale = 1.0f / (255.0f * 4.0f);
+
+        alignas(16) uint32_t shapes[4];
+        _mm_store_si128(reinterpret_cast<__m128i*>(shapes), _mm_castps_si128(partition));
+
+        const BC7PartitionLayout layouts[4] =
+        {
+            GetBC7ModePartitionLayout(mode, static_cast<uint8_t>(shapes[0] & 0x3Fu)),
+            GetBC7ModePartitionLayout(mode, static_cast<uint8_t>(shapes[1] & 0x3Fu)),
+            GetBC7ModePartitionLayout(mode, static_cast<uint8_t>(shapes[2] & 0x3Fu)),
+            GetBC7ModePartitionLayout(mode, static_cast<uint8_t>(shapes[3] & 0x3Fu))
+        };
+
+        // Evaluate all 16 texels in float across 4 channels
+        XMVECTOR texelColorsFloat[16][4];
+
+        for (size_t t = 0; t < 16; ++t)
+        {
+            // Build per-lane subset masks for texel t (supports subset 0, 1, 2)
+            alignas(16) uint32_t maskS1[4], maskS2[4];
+            for (size_t l = 0; l < 4; ++l)
+            {
+                const uint8_t s = layouts[l].subsetByTexel[t];
+                maskS1[l] = (s == 1) ? 0xFFFFFFFFu : 0u;
+                maskS2[l] = (s == 2) ? 0xFFFFFFFFu : 0u;
+            }
+            const XMVECTOR isS1 = _mm_castsi128_ps(_mm_load_si128(reinterpret_cast<const __m128i*>(maskS1)));
+            const XMVECTOR isS2 = _mm_castsi128_ps(_mm_load_si128(reinterpret_cast<const __m128i*>(maskS2)));
+
+            // Convert the mode's hardware interpolation weights to floating point.
+            const XMVECTOR weightFloat = XMConvertVectorUIntToFloat(LookupBC7Weight<IndexBits>(indices.indices[t]), 0);
+
+            // Interpolate each channel using the selected subset endpoints
+            for (size_t c = 0; c < 4; ++c)
+            {
+                XMVECTOR ep0 = XMVectorSelect(endpoints.value[0][0][c], endpoints.value[1][0][c], isS1);
+                ep0 = XMVectorSelect(ep0, endpoints.value[2][0][c], isS2);
+
+                XMVECTOR ep1 = XMVectorSelect(endpoints.value[0][1][c], endpoints.value[1][1][c], isS1);
+                ep1 = XMVectorSelect(ep1, endpoints.value[2][1][c], isS2);
+
+                const XMVECTOR colorUInt = InterpolateBC7PaletteVector(ep0, ep1, weightFloat);
+                texelColorsFloat[t][c] = XMConvertVectorUIntToFloat(colorUInt, 0);
+            }
+        }
+
+        // Sum texels for each of the four 2x2 quadrants
+        constexpr size_t quadrantTexels[4][4] =
+        {
+            { 0, 1, 4, 5 },     // Top-left
+            { 2, 3, 6, 7 },     // Top-right
+            { 8, 9, 12, 13 },   // Bottom-left
+            { 10, 11, 14, 15 }  // Bottom-right
+        };
+
+        BC7QuadrantMeanBatch result{};
+
+        for (size_t q = 0; q < 4; ++q)
+        {
+            const size_t t0 = quadrantTexels[q][0];
+            const size_t t1 = quadrantTexels[q][1];
+            const size_t t2 = quadrantTexels[q][2];
+            const size_t t3 = quadrantTexels[q][3];
+
+            for (size_t c = 0; c < 4; ++c)
+            {
+                XMVECTOR sum = XMVectorAdd(texelColorsFloat[t0][c], texelColorsFloat[t1][c]);
+                sum = XMVectorAdd(sum, texelColorsFloat[t2][c]);
+                sum = XMVectorAdd(sum, texelColorsFloat[t3][c]);
+                result.value[q][c] = XMVectorAndInt(XMVectorScale(sum, colorScale), activeMask);
+            }
+        }
+
+        return result;
+    }
+
+    // Backwards-compatible alias for two-subset callers
+    template<size_t IndexBits>
+    inline BC7QuadrantMeanBatch ComputeBC7TwoSubsetQuadrantMeans(
+        const BC7MultiSubsetEndpointBatch& endpoints,
+        FXMVECTOR partition,
+        const BC7IndexBatch& indices,
+        uint8_t mode,
+        FXMVECTOR activeMask) noexcept
+    {
+        return ComputeBC7MultiSubsetQuadrantMeans<IndexBits>(endpoints, partition, indices, mode, activeMask);
+    }
+
+    inline BC7QuadrantMeanBatch ComputeBC7Mode0QuadrantMeans(
+        const BC7MultiSubsetEndpointBatch& endpoints,
+        FXMVECTOR partition,
+        const BC7IndexBatch& indices,
+        FXMVECTOR activeMask) noexcept
+    {
+        return ComputeBC7MultiSubsetQuadrantMeans<3>(endpoints, partition, indices, 0, activeMask);
+    }
+
+    inline BC7QuadrantMeanBatch ComputeBC7Mode1QuadrantMeans(
+        const BC7MultiSubsetEndpointBatch& endpoints,
+        FXMVECTOR partition,
+        const BC7IndexBatch& indices,
+        FXMVECTOR activeMask) noexcept
+    {
+        return ComputeBC7MultiSubsetQuadrantMeans<3>(endpoints, partition, indices, 1, activeMask);
+    }
+
+    inline BC7QuadrantMeanBatch ComputeBC7Mode2QuadrantMeans(
+        const BC7MultiSubsetEndpointBatch& endpoints,
+        FXMVECTOR partition,
+        const BC7IndexBatch& indices,
+        FXMVECTOR activeMask) noexcept
+    {
+        return ComputeBC7MultiSubsetQuadrantMeans<2>(endpoints, partition, indices, 2, activeMask);
+    }
+
+    inline BC7QuadrantMeanBatch ComputeBC7Mode3QuadrantMeans(
+        const BC7MultiSubsetEndpointBatch& endpoints,
+        FXMVECTOR partition,
+        const BC7IndexBatch& indices,
+        FXMVECTOR activeMask) noexcept
+    {
+        return ComputeBC7MultiSubsetQuadrantMeans<2>(endpoints, partition, indices, 3, activeMask);
+    }
+
+    inline BC7QuadrantMeanBatch ComputeBC7Mode7QuadrantMeans(
+        const BC7MultiSubsetEndpointBatch& endpoints,
+        FXMVECTOR partition,
+        const BC7IndexBatch& indices,
+        FXMVECTOR activeMask) noexcept
+    {
+        return ComputeBC7MultiSubsetQuadrantMeans<2>(endpoints, partition, indices, 7, activeMask);
+    }
+
+    // Dispatch and compute exact quadrant means across mixed parent block modes (Mode 0, 1, 2, 3, 6, 7).
+    // Compute exact UNORM quadrant means for 1-subset dual-index BC7 modes with rotation (Mode 4 and Mode 5).
+    inline BC7QuadrantMeanBatch ComputeBC7DualIndexQuadrantMeans(
+        const BC7EndpointPairBatch& endpoints,
+        const BC7IndexBatch& idx1,
+        const BC7IndexBatch& idx2,
+        FXMVECTOR rotation,
+        FXMVECTOR indexMode,
+        bool isMode4,
+        FXMVECTOR activeMask) noexcept
+    {
+        constexpr float colorScale = 1.0f / (255.0f * 4.0f);
+
+        const XMVECTOR isRot1 = _mm_castsi128_ps(_mm_cmpeq_epi32(_mm_castps_si128(rotation), _mm_set1_epi32(1)));
+        const XMVECTOR isRot2 = _mm_castsi128_ps(_mm_cmpeq_epi32(_mm_castps_si128(rotation), _mm_set1_epi32(2)));
+        const XMVECTOR isRot3 = _mm_castsi128_ps(_mm_cmpeq_epi32(_mm_castps_si128(rotation), _mm_set1_epi32(3)));
+        const XMVECTOR isIdxMode1 = _mm_castsi128_ps(_mm_cmpeq_epi32(_mm_castps_si128(indexMode), _mm_set1_epi32(1)));
+
+        XMVECTOR texelColorsFloat[16][4];
+
+        for (size_t t = 0; t < 16; ++t)
+        {
+            XMVECTOR wcFloat, waFloat;
+            if (isMode4)
+            {
+                // Mode 4: idx1 is 2-bit, idx2 is 3-bit
+                const XMVECTOR w2 = XMConvertVectorUIntToFloat(LookupBC7Weight<2>(idx1.indices[t]), 0);
+                const XMVECTOR w3 = XMConvertVectorUIntToFloat(LookupBC7Weight<3>(idx2.indices[t]), 0);
+                wcFloat = XMVectorSelect(w2, w3, isIdxMode1);
+                waFloat = XMVectorSelect(w3, w2, isIdxMode1);
+            }
+            else
+            {
+                // Mode 5: both idx1 (color) and idx2 (alpha) are 2-bit
+                wcFloat = XMConvertVectorUIntToFloat(LookupBC7Weight<2>(idx1.indices[t]), 0);
+                waFloat = XMConvertVectorUIntToFloat(LookupBC7Weight<2>(idx2.indices[t]), 0);
+            }
+
+            // Interpolate RGB using wcFloat, A using waFloat
+            const XMVECTOR rInt = InterpolateBC7PaletteVector(endpoints.value[0][0], endpoints.value[1][0], wcFloat);
+            const XMVECTOR gInt = InterpolateBC7PaletteVector(endpoints.value[0][1], endpoints.value[1][1], wcFloat);
+            const XMVECTOR bInt = InterpolateBC7PaletteVector(endpoints.value[0][2], endpoints.value[1][2], wcFloat);
+            const XMVECTOR aInt = InterpolateBC7PaletteVector(endpoints.value[0][3], endpoints.value[1][3], waFloat);
+
+            const XMVECTOR r = XMConvertVectorUIntToFloat(rInt, 0);
+            const XMVECTOR g = XMConvertVectorUIntToFloat(gInt, 0);
+            const XMVECTOR b = XMConvertVectorUIntToFloat(bInt, 0);
+            const XMVECTOR a = XMConvertVectorUIntToFloat(aInt, 0);
+
+            // Channel rotation (swap with Alpha):
+            // rot=1: swap(R, A)
+            // rot=2: swap(G, A)
+            // rot=3: swap(B, A)
+            const XMVECTOR outR = XMVectorSelect(r, a, isRot1);
+            const XMVECTOR outG = XMVectorSelect(g, a, isRot2);
+            const XMVECTOR outB = XMVectorSelect(b, a, isRot3);
+            XMVECTOR outA = XMVectorSelect(a, r, isRot1);
+            outA = XMVectorSelect(outA, g, isRot2);
+            outA = XMVectorSelect(outA, b, isRot3);
+
+            texelColorsFloat[t][0] = outR;
+            texelColorsFloat[t][1] = outG;
+            texelColorsFloat[t][2] = outB;
+            texelColorsFloat[t][3] = outA;
+        }
+
+        constexpr size_t quadrantTexels[4][4] =
+        {
+            { 0, 1, 4, 5 },     // Top-left
+            { 2, 3, 6, 7 },     // Top-right
+            { 8, 9, 12, 13 },   // Bottom-left
+            { 10, 11, 14, 15 }  // Bottom-right
+        };
+
+        BC7QuadrantMeanBatch result{};
+        for (size_t q = 0; q < 4; ++q)
+        {
+            const size_t t0 = quadrantTexels[q][0];
+            const size_t t1 = quadrantTexels[q][1];
+            const size_t t2 = quadrantTexels[q][2];
+            const size_t t3 = quadrantTexels[q][3];
+
+            for (size_t c = 0; c < 4; ++c)
+            {
+                XMVECTOR sum = XMVectorAdd(texelColorsFloat[t0][c], texelColorsFloat[t1][c]);
+                sum = XMVectorAdd(sum, texelColorsFloat[t2][c]);
+                sum = XMVectorAdd(sum, texelColorsFloat[t3][c]);
+                result.value[q][c] = XMVectorAndInt(XMVectorScale(sum, colorScale), activeMask);
+            }
+        }
+
+        return result;
+    }
+
+    inline BC7QuadrantMeanBatch ComputeBC7Mode4QuadrantMeans(
+        const BC7EndpointPairBatch& endpoints,
+        const BC7IndexBatch& idx1,
+        const BC7IndexBatch& idx2,
+        FXMVECTOR rotation,
+        FXMVECTOR indexMode,
+        FXMVECTOR activeMask) noexcept
+    {
+        return ComputeBC7DualIndexQuadrantMeans(endpoints, idx1, idx2, rotation, indexMode, true, activeMask);
+    }
+
+    inline BC7QuadrantMeanBatch ComputeBC7Mode5QuadrantMeans(
+        const BC7EndpointPairBatch& endpoints,
+        const BC7IndexBatch& idx1,
+        const BC7IndexBatch& idx2,
+        FXMVECTOR rotation,
+        FXMVECTOR activeMask) noexcept
+    {
+        return ComputeBC7DualIndexQuadrantMeans(endpoints, idx1, idx2, rotation, XMVectorZero(), false, activeMask);
+    }
+
+    // Dispatch and compute exact quadrant means across mixed parent block modes (Mode 0 through 7).
+    inline BC7QuadrantMeanBatch ComputeBC7ParentQuadrantMeans(const BC7BlockBatch& blocks, FXMVECTOR activeMask) noexcept
+    {
+        const BC7ModeMaskBatch modeMasks = GetBC7ModeMasks(blocks);
+
+        BC7QuadrantMeanBatch result{};
+        for (size_t q = 0; q < 4; ++q)
+        {
+            for (size_t c = 0; c < 4; ++c)
+            {
+                result.value[q][c] = XMVectorZero();
+            }
+        }
+
+        // Mode 0 parent blocks (3 subsets, RGB 444 + 6 P-bits, 3-bit indices)
+        const XMVECTOR mask0 = XMVectorAndInt(modeMasks.mode[0], activeMask);
+        if (_mm_movemask_ps(mask0) != 0)
+        {
+            const XMVECTOR part0 = ExtractBC7Partition(blocks, 0, mask0);
+            const BC7MultiSubsetEndpointBatch ep0 = ExtractBC7Mode0Endpoints(blocks, mask0);
+            const BC7IndexBatch idx0 = ExtractBC7Mode0Indices(blocks, part0, mask0);
+            const BC7QuadrantMeanBatch q0 = ComputeBC7Mode0QuadrantMeans(ep0, part0, idx0, mask0);
+            for (size_t q = 0; q < 4; ++q)
+            {
+                for (size_t c = 0; c < 4; ++c)
+                {
+                    result.value[q][c] = XMVectorOrInt(result.value[q][c], q0.value[q][c]);
+                }
+            }
+        }
+
+        // Mode 1 parent blocks (2 subsets, RGB 666 + 2 P-bits, 3-bit indices)
+        const XMVECTOR mask1 = XMVectorAndInt(modeMasks.mode[1], activeMask);
+        if (_mm_movemask_ps(mask1) != 0)
+        {
+            const XMVECTOR part1 = ExtractBC7Partition(blocks, 1, mask1);
+            const BC7MultiSubsetEndpointBatch ep1 = ExtractBC7Mode1Endpoints(blocks, mask1);
+            const BC7IndexBatch idx1 = ExtractBC7Mode1Indices(blocks, part1, mask1);
+            const BC7QuadrantMeanBatch q1 = ComputeBC7Mode1QuadrantMeans(ep1, part1, idx1, mask1);
+            for (size_t q = 0; q < 4; ++q)
+            {
+                for (size_t c = 0; c < 4; ++c)
+                {
+                    result.value[q][c] = XMVectorOrInt(result.value[q][c], q1.value[q][c]);
+                }
+            }
+        }
+
+        // Mode 2 parent blocks (3 subsets, RGB 555, 2-bit indices)
+        const XMVECTOR mask2 = XMVectorAndInt(modeMasks.mode[2], activeMask);
+        if (_mm_movemask_ps(mask2) != 0)
+        {
+            const XMVECTOR part2 = ExtractBC7Partition(blocks, 2, mask2);
+            const BC7MultiSubsetEndpointBatch ep2 = ExtractBC7Mode2Endpoints(blocks, mask2);
+            const BC7IndexBatch idx2 = ExtractBC7Mode2Indices(blocks, part2, mask2);
+            const BC7QuadrantMeanBatch q2 = ComputeBC7Mode2QuadrantMeans(ep2, part2, idx2, mask2);
+            for (size_t q = 0; q < 4; ++q)
+            {
+                for (size_t c = 0; c < 4; ++c)
+                {
+                    result.value[q][c] = XMVectorOrInt(result.value[q][c], q2.value[q][c]);
+                }
+            }
+        }
+
+        // Mode 3 parent blocks (2 subsets, RGB 777 + 4 P-bits, 2-bit indices)
+        const XMVECTOR mask3 = XMVectorAndInt(modeMasks.mode[3], activeMask);
+        if (_mm_movemask_ps(mask3) != 0)
+        {
+            const XMVECTOR part3 = ExtractBC7Partition(blocks, 3, mask3);
+            const BC7MultiSubsetEndpointBatch ep3 = ExtractBC7Mode3Endpoints(blocks, mask3);
+            const BC7IndexBatch idx3 = ExtractBC7Mode3Indices(blocks, part3, mask3);
+            const BC7QuadrantMeanBatch q3 = ComputeBC7Mode3QuadrantMeans(ep3, part3, idx3, mask3);
+            for (size_t q = 0; q < 4; ++q)
+            {
+                for (size_t c = 0; c < 4; ++c)
+                {
+                    result.value[q][c] = XMVectorOrInt(result.value[q][c], q3.value[q][c]);
+                }
+            }
+        }
+
+        // Mode 4 parent blocks (1 subset, RGB 555 + A 6, 2-bit/3-bit dual indices, rotation)
+        const XMVECTOR mask4 = XMVectorAndInt(modeMasks.mode[4], activeMask);
+        if (_mm_movemask_ps(mask4) != 0)
+        {
+            const XMVECTOR rot4 = ExtractBC7Bits<5, 2>(blocks);
+            const XMVECTOR idxMode4 = ExtractBC7Bits<7, 1>(blocks);
+            const BC7EndpointPairBatch ep4 = ExtractBC7Mode4Endpoints(blocks, mask4);
+            const BC7IndexBatch idx1 = ExtractBC7PartitionedIndices(blocks, XMVectorZero(), 4, 50, 2, mask4);
+            const BC7IndexBatch idx2 = ExtractBC7PartitionedIndices(blocks, XMVectorZero(), 4, 81, 3, mask4);
+            const BC7QuadrantMeanBatch q4 = ComputeBC7Mode4QuadrantMeans(ep4, idx1, idx2, rot4, idxMode4, mask4);
+            for (size_t q = 0; q < 4; ++q)
+            {
+                for (size_t c = 0; c < 4; ++c)
+                {
+                    result.value[q][c] = XMVectorOrInt(result.value[q][c], q4.value[q][c]);
+                }
+            }
+        }
+
+        // Mode 5 parent blocks (1 subset, RGB 777 + A 8, 2-bit/2-bit dual indices, rotation)
+        const XMVECTOR mask5 = XMVectorAndInt(modeMasks.mode[5], activeMask);
+        if (_mm_movemask_ps(mask5) != 0)
+        {
+            const XMVECTOR rot5 = ExtractBC7Bits<6, 2>(blocks);
+            const BC7EndpointPairBatch ep5 = ExtractBC7Mode5Endpoints(blocks, mask5);
+            const BC7IndexBatch idx1 = ExtractBC7PartitionedIndices(blocks, XMVectorZero(), 5, 66, 2, mask5);
+            const BC7IndexBatch idx2 = ExtractBC7PartitionedIndices(blocks, XMVectorZero(), 5, 97, 2, mask5);
+            const BC7QuadrantMeanBatch q5 = ComputeBC7Mode5QuadrantMeans(ep5, idx1, idx2, rot5, mask5);
+            for (size_t q = 0; q < 4; ++q)
+            {
+                for (size_t c = 0; c < 4; ++c)
+                {
+                    result.value[q][c] = XMVectorOrInt(result.value[q][c], q5.value[q][c]);
+                }
+            }
+        }
+
+        // Mode 6 parent blocks (1 subset, RGBA 7777 + 2 P-bits, 4-bit indices)
+        const XMVECTOR mask6 = XMVectorAndInt(modeMasks.mode[6], activeMask);
+        if (_mm_movemask_ps(mask6) != 0)
+        {
+            const BC7EndpointPairBatch ep6 = ExtractBC7Mode6Endpoints(blocks, mask6);
+            const BC7Mode6PackedIndexBatch idx6 = ExtractBC7Mode6PackedIndices(blocks, mask6);
+            const BC7QuadrantMeanBatch q6 = ComputeBC7Mode6QuadrantMeans(ep6, idx6, mask6);
+            for (size_t q = 0; q < 4; ++q)
+            {
+                for (size_t c = 0; c < 4; ++c)
+                {
+                    result.value[q][c] = XMVectorOrInt(result.value[q][c], q6.value[q][c]);
+                }
+            }
+        }
+
+        // Mode 7 parent blocks (2 subsets, RGBA 5555 + 4 P-bits, 2-bit indices)
+        const XMVECTOR mask7 = XMVectorAndInt(modeMasks.mode[7], activeMask);
+        if (_mm_movemask_ps(mask7) != 0)
+        {
+            const XMVECTOR part7 = ExtractBC7Partition(blocks, 7, mask7);
+            const BC7MultiSubsetEndpointBatch ep7 = ExtractBC7Mode7Endpoints(blocks, mask7);
+            const BC7IndexBatch idx7 = ExtractBC7Mode7Indices(blocks, part7, mask7);
+            const BC7QuadrantMeanBatch q7 = ComputeBC7Mode7QuadrantMeans(ep7, part7, idx7, mask7);
+            for (size_t q = 0; q < 4; ++q)
+            {
+                for (size_t c = 0; c < 4; ++c)
+                {
+                    result.value[q][c] = XMVectorOrInt(result.value[q][c], q7.value[q][c]);
+                }
             }
         }
 
@@ -2058,77 +3110,76 @@ namespace // for bc7
         covariance.ba = XMVectorAdd(between.ba, within.ba);
     }
 
-    // Expand the 4D projection range with one RGBA quadrant sample.
-    inline void ExpandBC7ProjectionRange(
-        const XMVECTOR sample[4],
-        const BC7BlockMeanBatch& axis,
-        const BC7BlockMeanBatch& mean,
-        XMVECTOR& minimum,
-        XMVECTOR& maximum) noexcept
-    {
-        XMVECTOR proj = XMVectorMultiply(axis.value[0], XMVectorSubtract(sample[0], mean.value[0]));
-        proj = XMVectorMultiplyAdd(axis.value[1], XMVectorSubtract(sample[1], mean.value[1]), proj);
-        proj = XMVectorMultiplyAdd(axis.value[2], XMVectorSubtract(sample[2], mean.value[2]), proj);
-        proj = XMVectorMultiplyAdd(axis.value[3], XMVectorSubtract(sample[3], mean.value[3]), proj);
-        minimum = XMVectorMin(minimum, proj);
-        maximum = XMVectorMax(maximum, proj);
-    }
-
-    // Expand the 4D projection range with all four quadrants of one parent block.
-    inline void ExpandBC7ParentProjectionRange(
-        const BC7QuadrantMeanBatch& parent,
-        const BC7BlockMeanBatch& axis,
-        const BC7BlockMeanBatch& mean,
-        XMVECTOR& minimum,
-        XMVECTOR& maximum) noexcept
-    {
-        for (size_t q = 0; q < 4; ++q)
-        {
-            ExpandBC7ProjectionRange(parent.value[q], axis, mean, minimum, maximum);
-        }
-    }
-
-    // Estimate the 4D principal axis and initial RGBA endpoints using Power Iteration PCA.
-    inline BC7EndpointPairFloatBatch ComputeInitialEndpointsBC7Mode6PCA(
-        const BC7CovarianceMatrixBatch& covariance,
-        const BC7BlockMeanBatch& mean,
+    // Build the canonical intermediate representation (IR) of the downsampled child block.
+    inline BC7ChildCanvas BuildBC7ChildCanvas(
         const BC7QuadrantMeanBatch& p00,
         const BC7QuadrantMeanBatch& p10,
         const BC7QuadrantMeanBatch& p01,
-        const BC7QuadrantMeanBatch& p11) noexcept
+        const BC7QuadrantMeanBatch& p11,
+        BC7SourceBlockMeansBatch& sourceMeans) noexcept
     {
-        // Begin power iteration with a normalized diagonal direction in 4D (RGBA) space.
-        // In 4D, (0.5, 0.5, 0.5, 0.5) has length 1.0 (0.5^2 * 4 = 1.0).
-        BC7BlockMeanBatch axis{};
+        BC7ChildCanvas canvas{};
+
+        // 1. Map parent quadrants to the 16 child texels (RGBA [0, 1] float)
+        for (size_t c = 0; c < 4; ++c)
+        {
+            canvas.texels[0][c]  = p00.value[0][c];
+            canvas.texels[1][c]  = p00.value[1][c];
+            canvas.texels[2][c]  = p10.value[0][c];
+            canvas.texels[3][c]  = p10.value[1][c];
+
+            canvas.texels[4][c]  = p00.value[2][c];
+            canvas.texels[5][c]  = p00.value[3][c];
+            canvas.texels[6][c]  = p10.value[2][c];
+            canvas.texels[7][c]  = p10.value[3][c];
+
+            canvas.texels[8][c]  = p01.value[0][c];
+            canvas.texels[9][c]  = p01.value[1][c];
+            canvas.texels[10][c] = p11.value[0][c];
+            canvas.texels[11][c] = p11.value[1][c];
+
+            canvas.texels[12][c] = p01.value[2][c];
+            canvas.texels[13][c] = p01.value[3][c];
+            canvas.texels[14][c] = p11.value[2][c];
+            canvas.texels[15][c] = p11.value[3][c];
+        }
+
+        // 2. Compute child block mean and 4D ANOVA covariance matrix
+        ComputeBC7ChildBlockMoments(p00, p10, p01, p11, sourceMeans, canvas.mean, canvas.covariance);
+
+        // 3. Measure opacity across all 16 child texels (Alpha >= 254.0/255.0)
+        const XMVECTOR alphaThreshold = XMVectorReplicate(254.0f / 255.0f);
+        XMVECTOR isOpaque = XMVectorTrueInt();
+        for (size_t t = 0; t < 16; ++t)
+        {
+            const XMVECTOR opaqueTexel = XMVectorGreaterOrEqual(canvas.texels[t][3], alphaThreshold);
+            isOpaque = XMVectorAndInt(isOpaque, opaqueTexel);
+        }
+        canvas.isOpaque = isOpaque;
+
+        // 4. Extract 4D principal axis using power iteration PCA
         const XMVECTOR diag = XMVectorReplicate(0.5f);
-        axis.value[0] = diag;
-        axis.value[1] = diag;
-        axis.value[2] = diag;
-        axis.value[3] = diag;
-
-        // Multiply the initial direction by the 4x4 covariance matrix once to approach principal axis.
         BC7BlockMeanBatch next{};
-        next.value[0] = XMVectorMultiply(covariance.rr, axis.value[0]);
-        next.value[0] = XMVectorMultiplyAdd(covariance.rg, axis.value[1], next.value[0]);
-        next.value[0] = XMVectorMultiplyAdd(covariance.rb, axis.value[2], next.value[0]);
-        next.value[0] = XMVectorMultiplyAdd(covariance.ra, axis.value[3], next.value[0]);
+        next.value[0] = XMVectorMultiply(canvas.covariance.rr, diag);
+        next.value[0] = XMVectorMultiplyAdd(canvas.covariance.rg, diag, next.value[0]);
+        next.value[0] = XMVectorMultiplyAdd(canvas.covariance.rb, diag, next.value[0]);
+        next.value[0] = XMVectorMultiplyAdd(canvas.covariance.ra, diag, next.value[0]);
 
-        next.value[1] = XMVectorMultiply(covariance.rg, axis.value[0]);
-        next.value[1] = XMVectorMultiplyAdd(covariance.gg, axis.value[1], next.value[1]);
-        next.value[1] = XMVectorMultiplyAdd(covariance.gb, axis.value[2], next.value[1]);
-        next.value[1] = XMVectorMultiplyAdd(covariance.ga, axis.value[3], next.value[1]);
+        next.value[1] = XMVectorMultiply(canvas.covariance.rg, diag);
+        next.value[1] = XMVectorMultiplyAdd(canvas.covariance.gg, diag, next.value[1]);
+        next.value[1] = XMVectorMultiplyAdd(canvas.covariance.gb, diag, next.value[1]);
+        next.value[1] = XMVectorMultiplyAdd(canvas.covariance.ga, diag, next.value[1]);
 
-        next.value[2] = XMVectorMultiply(covariance.rb, axis.value[0]);
-        next.value[2] = XMVectorMultiplyAdd(covariance.gb, axis.value[1], next.value[2]);
-        next.value[2] = XMVectorMultiplyAdd(covariance.bb, axis.value[2], next.value[2]);
-        next.value[2] = XMVectorMultiplyAdd(covariance.ba, axis.value[3], next.value[2]);
+        next.value[2] = XMVectorMultiply(canvas.covariance.rb, diag);
+        next.value[2] = XMVectorMultiplyAdd(canvas.covariance.gb, diag, next.value[2]);
+        next.value[2] = XMVectorMultiplyAdd(canvas.covariance.bb, diag, next.value[2]);
+        next.value[2] = XMVectorMultiplyAdd(canvas.covariance.ba, diag, next.value[2]);
 
-        next.value[3] = XMVectorMultiply(covariance.ra, axis.value[0]);
-        next.value[3] = XMVectorMultiplyAdd(covariance.ga, axis.value[1], next.value[3]);
-        next.value[3] = XMVectorMultiplyAdd(covariance.ba, axis.value[2], next.value[3]);
-        next.value[3] = XMVectorMultiplyAdd(covariance.aa, axis.value[3], next.value[3]);
+        next.value[3] = XMVectorMultiply(canvas.covariance.ra, diag);
+        next.value[3] = XMVectorMultiplyAdd(canvas.covariance.ga, diag, next.value[3]);
+        next.value[3] = XMVectorMultiplyAdd(canvas.covariance.ba, diag, next.value[3]);
+        next.value[3] = XMVectorMultiplyAdd(canvas.covariance.aa, diag, next.value[3]);
 
-        // Normalize the estimated 4D axis; epsilon keeps flat-color blocks finite.
         XMVECTOR lengthSquared = XMVectorMultiply(next.value[0], next.value[0]);
         lengthSquared = XMVectorMultiplyAdd(next.value[1], next.value[1], lengthSquared);
         lengthSquared = XMVectorMultiplyAdd(next.value[2], next.value[2], lengthSquared);
@@ -2136,26 +3187,1586 @@ namespace // for bc7
         lengthSquared = XMVectorAdd(lengthSquared, XMVectorReplicate(1e-20f));
 
         const XMVECTOR inverseLength = XMVectorReciprocalSqrt(lengthSquared);
-        axis.value[0] = XMVectorMultiply(next.value[0], inverseLength);
-        axis.value[1] = XMVectorMultiply(next.value[1], inverseLength);
-        axis.value[2] = XMVectorMultiply(next.value[2], inverseLength);
-        axis.value[3] = XMVectorMultiply(next.value[3], inverseLength);
+        canvas.axis.value[0] = XMVectorMultiply(next.value[0], inverseLength);
+        canvas.axis.value[1] = XMVectorMultiply(next.value[1], inverseLength);
+        canvas.axis.value[2] = XMVectorMultiply(next.value[2], inverseLength);
+        canvas.axis.value[3] = XMVectorMultiply(next.value[3], inverseLength);
 
-        // Project all 16 quadrant means and retain the minimum and maximum positions.
+        return canvas;
+    }
+
+    // Bit writer writing up to 128 bits into an XMUINT4 block.
+    inline void WriteBC7Bits(uint8_t* block, size_t& bitOffset, uint32_t value, size_t bitCount) noexcept
+    {
+        assert(block != nullptr);
+        assert(bitOffset + bitCount <= 128);
+
+        for (size_t i = 0; i < bitCount; ++i)
+        {
+            const size_t totalBit = bitOffset + i;
+            const size_t byteIdx = totalBit >> 3;
+            const size_t bitIdx = totalBit & 7;
+            if ((value >> i) & 1u)
+            {
+                block[byteIdx] |= static_cast<uint8_t>(1u << bitIdx);
+            }
+            else
+            {
+                block[byteIdx] &= static_cast<uint8_t>(~(1u << bitIdx));
+            }
+        }
+        bitOffset += bitCount;
+    }
+
+    // Precomputed 16-bit partition masks for 64 2-subset shapes.
+    struct BC7PartitionMaskTable2Subsets
+    {
+        uint16_t mask[64];
+        constexpr BC7PartitionMaskTable2Subsets() : mask{}
+        {
+            for (uint32_t s = 0; s < 64; ++s)
+            {
+                uint16_t m = 0;
+                for (uint32_t i = 0; i < 16; ++i)
+                {
+                    m |= static_cast<uint16_t>(g_bc7PartitionTable2Subsets[s][i] << i);
+                }
+                mask[s] = m;
+            }
+        }
+    };
+    constexpr BC7PartitionMaskTable2Subsets g_bc7PartitionMasks2Subsets{};
+
+    // FasTC-style Hamming distance partition estimation for 2-subset modes.
+    // Zero arbitrary thresholds: finds the exact argmin Hamming distance shape!
+    inline XMVECTOR EstimateBC7Partition2Subsets(const BC7ChildCanvas& canvas) noexcept
+    {
+        // 1. Project 16 child texels onto the canvas principal axis: p_t = (C_t - mean) . axis
+        alignas(16) float projLanes[16][4];
+        for (size_t t = 0; t < 16; ++t)
+        {
+            XMVECTOR proj = XMVectorMultiply(canvas.axis.value[0], XMVectorSubtract(canvas.texels[t][0], canvas.mean.value[0]));
+            proj = XMVectorMultiplyAdd(canvas.axis.value[1], XMVectorSubtract(canvas.texels[t][1], canvas.mean.value[1]), proj);
+            proj = XMVectorMultiplyAdd(canvas.axis.value[2], XMVectorSubtract(canvas.texels[t][2], canvas.mean.value[2]), proj);
+            proj = XMVectorMultiplyAdd(canvas.axis.value[3], XMVectorSubtract(canvas.texels[t][3], canvas.mean.value[3]), proj);
+            _mm_store_ps(projLanes[t], proj);
+        }
+
+        // 2. For each SIMD lane, construct 16-bit projection mask and find argmin Hamming distance
+        alignas(16) uint32_t bestShapes[4]{};
+        for (size_t lane = 0; lane < 4; ++lane)
+        {
+            uint16_t projMask = 0;
+            for (size_t t = 0; t < 16; ++t)
+            {
+                if (projLanes[t][lane] >= 0.0f)
+                {
+                    projMask |= static_cast<uint16_t>(1u << t);
+                }
+            }
+
+            uint32_t minDistance = 999;
+            uint32_t bestS = 0;
+            const uint16_t invProjMask = static_cast<uint16_t>(~projMask);
+
+            for (uint32_t s = 0; s < 64; ++s)
+            {
+                const uint16_t shapeMask = g_bc7PartitionMasks2Subsets.mask[s];
+                // Subset polarity invariant: min(popcount(M ^ S), popcount((~M) ^ S))
+                const uint32_t d0 = static_cast<uint32_t>(_mm_popcnt_u32(projMask ^ shapeMask));
+                const uint32_t d1 = static_cast<uint32_t>(_mm_popcnt_u32(invProjMask ^ shapeMask));
+                const uint32_t d = (d0 < d1) ? d0 : d1;
+
+                if (d < minDistance)
+                {
+                    minDistance = d;
+                    bestS = s;
+                }
+            }
+            bestShapes[lane] = bestS;
+        }
+
+        return _mm_castsi128_ps(_mm_load_si128(reinterpret_cast<const __m128i*>(bestShapes)));
+    }
+
+    struct BC7Partition3SubsetsResult
+    {
+        XMVECTOR mode0Shape; // Shape 0..15 per lane
+        XMVECTOR mode2Shape; // Shape 0..63 per lane
+    };
+
+    // FasTC-style 3-subset partition estimation for Mode 0 (shapes 0..15) and Mode 2 (shapes 0..63).
+    // Zero arbitrary thresholds: projects onto principal axis, splits into 3 tertiles, and finds argmax match.
+    inline BC7Partition3SubsetsResult EstimateBC7Partition3Subsets(const BC7ChildCanvas& canvas) noexcept
+    {
+        alignas(16) float projLanes[16][4];
+        for (size_t t = 0; t < 16; ++t)
+        {
+            XMVECTOR proj = XMVectorMultiply(canvas.axis.value[0], XMVectorSubtract(canvas.texels[t][0], canvas.mean.value[0]));
+            proj = XMVectorMultiplyAdd(canvas.axis.value[1], XMVectorSubtract(canvas.texels[t][1], canvas.mean.value[1]), proj);
+            proj = XMVectorMultiplyAdd(canvas.axis.value[2], XMVectorSubtract(canvas.texels[t][2], canvas.mean.value[2]), proj);
+            proj = XMVectorMultiplyAdd(canvas.axis.value[3], XMVectorSubtract(canvas.texels[t][3], canvas.mean.value[3]), proj);
+            _mm_store_ps(projLanes[t], proj);
+        }
+
+        alignas(16) uint32_t bestMode0Shapes[4]{};
+        alignas(16) uint32_t bestMode2Shapes[4]{};
+
+        for (size_t lane = 0; lane < 4; ++lane)
+        {
+            float pMin = projLanes[0][lane];
+            float pMax = projLanes[0][lane];
+            for (size_t t = 1; t < 16; ++t)
+            {
+                if (projLanes[t][lane] < pMin) pMin = projLanes[t][lane];
+                if (projLanes[t][lane] > pMax) pMax = projLanes[t][lane];
+            }
+
+            const float delta = pMax - pMin;
+            const float b1 = pMin + delta * (1.0f / 3.0f);
+            const float b2 = pMin + delta * (2.0f / 3.0f);
+
+            uint8_t L[16]{};
+            for (size_t t = 0; t < 16; ++t)
+            {
+                const float p = projLanes[t][lane];
+                L[t] = (p < b1) ? 0 : ((p < b2) ? 1 : 2);
+            }
+
+            // Invariant: Texel 0 in BC7 3-subset partitions is always in subset 0.
+            // Renumber labels so L[0] == 0.
+            const uint8_t l0 = L[0];
+            if (l0 != 0)
+            {
+                for (size_t t = 0; t < 16; ++t)
+                {
+                    if (L[t] == 0) L[t] = l0;
+                    else if (L[t] == l0) L[t] = 0;
+                }
+            }
+
+            // Permuted label where subsets 1 and 2 are swapped
+            uint8_t L_swap[16]{};
+            for (size_t t = 0; t < 16; ++t)
+            {
+                L_swap[t] = (L[t] == 1) ? 2 : ((L[t] == 2) ? 1 : 0);
+            }
+
+            // Find best shape for Mode 0 (shapes 0..15) and Mode 2 (shapes 0..63)
+            uint32_t bestMatchM0 = 0;
+            uint32_t bestShapeM0 = 0;
+
+            uint32_t bestMatchM2 = 0;
+            uint32_t bestShapeM2 = 0;
+
+            for (uint32_t s = 0; s < 64; ++s)
+            {
+                uint32_t matchA = 0;
+                uint32_t matchB = 0;
+                for (size_t t = 0; t < 16; ++t)
+                {
+                    const uint8_t tableVal = g_bc7PartitionTable3Subsets[s][t];
+                    if (tableVal == L[t]) ++matchA;
+                    if (tableVal == L_swap[t]) ++matchB;
+                }
+                const uint32_t match = (matchA > matchB) ? matchA : matchB;
+
+                if (s < 16 && match > bestMatchM0)
+                {
+                    bestMatchM0 = match;
+                    bestShapeM0 = s;
+                }
+                if (match > bestMatchM2)
+                {
+                    bestMatchM2 = match;
+                    bestShapeM2 = s;
+                }
+            }
+
+            bestMode0Shapes[lane] = bestShapeM0;
+            bestMode2Shapes[lane] = bestShapeM2;
+        }
+
+        BC7Partition3SubsetsResult result{};
+        result.mode0Shape = _mm_castsi128_ps(_mm_load_si128(reinterpret_cast<const __m128i*>(bestMode0Shapes)));
+        result.mode2Shape = _mm_castsi128_ps(_mm_load_si128(reinterpret_cast<const __m128i*>(bestMode2Shapes)));
+        return result;
+    }
+
+    // Pack Mode 1 fields into one 128-bit BC7 block.
+    inline XMUINT4 EmitBC7Mode1BlockScalar(
+        uint32_t partition,
+        const uint8_t ep[2][2][3], // [subset 0..1][ep 0..1][rgb 0..2] (6-bit values)
+        const uint8_t pBit[2],     // [subset 0..1]
+        const uint8_t indices[16]) noexcept
+    {
+        uint8_t bytes[16]{};
+        size_t bitOffset = 0;
+
+        // Mode 1 prefix: 0b10 (bit 0 = 0, bit 1 = 1) -> 2 bits
+        WriteBC7Bits(bytes, bitOffset, 0b10, 2);
+
+        // Partition: 6 bits
+        WriteBC7Bits(bytes, bitOffset, partition, 6);
+
+        // Endpoints (R, G, B order, subset 0 ep 0, ep 1, subset 1 ep 0, ep 1)
+        for (size_t c = 0; c < 3; ++c)
+        {
+            WriteBC7Bits(bytes, bitOffset, ep[0][0][c], 6);
+            WriteBC7Bits(bytes, bitOffset, ep[0][1][c], 6);
+            WriteBC7Bits(bytes, bitOffset, ep[1][0][c], 6);
+            WriteBC7Bits(bytes, bitOffset, ep[1][1][c], 6);
+        }
+
+        // P-bits (subset 0, subset 1)
+        WriteBC7Bits(bytes, bitOffset, pBit[0], 1);
+        WriteBC7Bits(bytes, bitOffset, pBit[1], 1);
+
+        // Indices (3 bits each, except anchor texels which have 2 bits)
+        const uint8_t anchor1 = g_bc7FixUp2Subsets[partition];
+
+        for (size_t t = 0; t < 16; ++t)
+        {
+            const size_t bitCount = (t == 0 || t == anchor1) ? 2 : 3;
+            WriteBC7Bits(bytes, bitOffset, indices[t], bitCount);
+        }
+
+        assert(bitOffset == 128);
+
+        XMUINT4 result;
+        memcpy(&result, bytes, sizeof(result));
+        return result;
+    }
+
+    struct BC7Mode1FitResult
+    {
+        XMUINT4 block;
+        float totalError; // Sum of squared RGB errors across all 16 texels
+    };
+
+    // Fit Mode 1 endpoints and 3-bit indices for a single lane, returning 128-bit block and exact reconstruction error.
+    inline BC7Mode1FitResult FitBC7Mode1SingleLane(
+        const BC7ChildCanvas& canvas,
+        uint32_t partition,
+        size_t lane) noexcept
+    {
+        alignas(16) float texelsRGB[16][3];
+        for (size_t t = 0; t < 16; ++t)
+        {
+            for (size_t c = 0; c < 3; ++c)
+            {
+                texelsRGB[t][c] = XMVectorGetByIndex(canvas.texels[t][c], lane);
+            }
+        }
+
+        uint8_t ep6[2][2][3]{};
+        uint8_t pBits[2]{};
+        uint8_t unquantEP[2][2][3]{};
+
+        // 1. Quantize endpoints for each subset
+        for (size_t s = 0; s < 2; ++s)
+        {
+            float minC[3] = { 1.0f, 1.0f, 1.0f };
+            float maxC[3] = { 0.0f, 0.0f, 0.0f };
+            bool hasTexels = false;
+
+            for (size_t t = 0; t < 16; ++t)
+            {
+                if (g_bc7PartitionTable2Subsets[partition][t] == s)
+                {
+                    hasTexels = true;
+                    for (size_t c = 0; c < 3; ++c)
+                    {
+                        if (texelsRGB[t][c] < minC[c]) minC[c] = texelsRGB[t][c];
+                        if (texelsRGB[t][c] > maxC[c]) maxC[c] = texelsRGB[t][c];
+                    }
+                }
+            }
+
+            if (!hasTexels)
+            {
+                minC[0] = minC[1] = minC[2] = 0.0f;
+                maxC[0] = maxC[1] = maxC[2] = 0.0f;
+            }
+
+            uint32_t lsbSum = 0;
+            int q0[3]{}, q1[3]{};
+            for (size_t c = 0; c < 3; ++c)
+            {
+                q0[c] = std::min(127, std::max(0, static_cast<int>(std::round(minC[c] * 127.0f))));
+                q1[c] = std::min(127, std::max(0, static_cast<int>(std::round(maxC[c] * 127.0f))));
+                lsbSum += (q0[c] & 1) + (q1[c] & 1);
+            }
+
+            // Majority vote for shared P-bit
+            const uint8_t p = (lsbSum >= 3) ? 1 : 0;
+            pBits[s] = p;
+
+            for (size_t c = 0; c < 3; ++c)
+            {
+                ep6[s][0][c] = static_cast<uint8_t>(std::min(63, std::max(0, (q0[c] - p + 1) / 2)));
+                ep6[s][1][c] = static_cast<uint8_t>(std::min(63, std::max(0, (q1[c] - p + 1) / 2)));
+
+                // D3D Mode 1 unquantization: v7 = (q << 1) | p, v8 = (v7 << 1) | (v7 >> 6)
+                unquantEP[s][0][c] = UnquantizeBC7_6BitScalar(ep6[s][0][c], p);
+                unquantEP[s][1][c] = UnquantizeBC7_6BitScalar(ep6[s][1][c], p);
+            }
+        }
+
+        // 2. Build 8-color palette for each subset
+        constexpr uint32_t weights[8] = { 0, 9, 18, 27, 37, 46, 55, 64 };
+        float palette[2][8][3];
+        for (size_t s = 0; s < 2; ++s)
+        {
+            for (uint32_t k = 0; k < 8; ++k)
+            {
+                for (size_t c = 0; c < 3; ++c)
+                {
+                    const uint32_t val = ((64u - weights[k]) * unquantEP[s][0][c] + weights[k] * unquantEP[s][1][c] + 32u) >> 6;
+                    palette[s][k][c] = static_cast<float>(val) / 255.0f;
+                }
+            }
+        }
+
+        // 3. Assign nearest index and accumulate reconstruction error
+        uint8_t indices[16]{};
+        float totalError = 0.0f;
+
+        for (size_t t = 0; t < 16; ++t)
+        {
+            const size_t s = g_bc7PartitionTable2Subsets[partition][t];
+            float bestDist = 1e10f;
+            uint8_t bestK = 0;
+
+            for (uint8_t k = 0; k < 8; ++k)
+            {
+                float d = 0.0f;
+                for (size_t c = 0; c < 3; ++c)
+                {
+                    const float diff = texelsRGB[t][c] - palette[s][k][c];
+                    d += diff * diff;
+                }
+                if (d < bestDist)
+                {
+                    bestDist = d;
+                    bestK = k;
+                }
+            }
+
+            indices[t] = bestK;
+            totalError += bestDist;
+        }
+
+        // 4. Anchor constraints:
+        // Subset 0 anchor: texel 0. MSB must be 0 (index <= 3).
+        if (indices[0] >= 4)
+        {
+            for (size_t c = 0; c < 3; ++c)
+            {
+                std::swap(ep6[0][0][c], ep6[0][1][c]);
+            }
+            for (size_t t = 0; t < 16; ++t)
+            {
+                if (g_bc7PartitionTable2Subsets[partition][t] == 0)
+                {
+                    indices[t] = static_cast<uint8_t>(7u - indices[t]);
+                }
+            }
+        }
+
+        // Subset 1 anchor: texel anchor1. MSB must be 0 (index <= 3).
+        const uint8_t anchor1 = g_bc7FixUp2Subsets[partition];
+        if (indices[anchor1] >= 4)
+        {
+            for (size_t c = 0; c < 3; ++c)
+            {
+                std::swap(ep6[1][0][c], ep6[1][1][c]);
+            }
+            for (size_t t = 0; t < 16; ++t)
+            {
+                if (g_bc7PartitionTable2Subsets[partition][t] == 1)
+                {
+                    indices[t] = static_cast<uint8_t>(7u - indices[t]);
+                }
+            }
+        }
+
+        // 5. Emit 128-bit block
+        BC7Mode1FitResult result{};
+        result.block = EmitBC7Mode1BlockScalar(partition, ep6, pBits, indices);
+        result.totalError = totalError;
+        return result;
+    }
+
+    // Pack Mode 3 fields into one 128-bit BC7 block.
+    inline XMUINT4 EmitBC7Mode3BlockScalar(
+        uint32_t partition,
+        const uint8_t ep[2][2][3], // [subset 0..1][ep 0..1][rgb 0..2] (7-bit values)
+        const uint8_t pBit[2][2],  // [subset 0..1][ep 0..1]
+        const uint8_t indices[16]) noexcept
+    {
+        uint8_t bytes[16]{};
+        size_t bitOffset = 0;
+
+        // Mode 3 prefix: 0b1000 (bit 0..2 = 0, bit 3 = 1) -> 4 bits
+        WriteBC7Bits(bytes, bitOffset, 0b1000, 4);
+
+        // Partition: 6 bits
+        WriteBC7Bits(bytes, bitOffset, partition, 6);
+
+        // Endpoints (R, G, B order, subset 0 ep 0, ep 1, subset 1 ep 0, ep 1)
+        for (size_t c = 0; c < 3; ++c)
+        {
+            WriteBC7Bits(bytes, bitOffset, ep[0][0][c], 7);
+            WriteBC7Bits(bytes, bitOffset, ep[0][1][c], 7);
+            WriteBC7Bits(bytes, bitOffset, ep[1][0][c], 7);
+            WriteBC7Bits(bytes, bitOffset, ep[1][1][c], 7);
+        }
+
+        // P-bits: 4 bits (subset 0 ep 0, ep 1, subset 1 ep 0, ep 1)
+        WriteBC7Bits(bytes, bitOffset, pBit[0][0], 1);
+        WriteBC7Bits(bytes, bitOffset, pBit[0][1], 1);
+        WriteBC7Bits(bytes, bitOffset, pBit[1][0], 1);
+        WriteBC7Bits(bytes, bitOffset, pBit[1][1], 1);
+
+        // Indices (2 bits each, except anchor texels which have 1 bit)
+        const uint8_t anchor1 = g_bc7FixUp2Subsets[partition];
+
+        for (size_t t = 0; t < 16; ++t)
+        {
+            const size_t bitCount = (t == 0 || t == anchor1) ? 1 : 2;
+            WriteBC7Bits(bytes, bitOffset, indices[t], bitCount);
+        }
+
+        assert(bitOffset == 128);
+
+        XMUINT4 result;
+        memcpy(&result, bytes, sizeof(result));
+        return result;
+    }
+
+    struct BC7Mode3FitResult
+    {
+        XMUINT4 block;
+        float totalError;
+    };
+
+    // Fit Mode 3 endpoints and 2-bit indices for a single lane, returning 128-bit block and exact reconstruction error.
+    inline BC7Mode3FitResult FitBC7Mode3SingleLane(
+        const BC7ChildCanvas& canvas,
+        uint32_t partition,
+        size_t lane) noexcept
+    {
+        alignas(16) float texelsRGB[16][3];
+        for (size_t t = 0; t < 16; ++t)
+        {
+            for (size_t c = 0; c < 3; ++c)
+            {
+                texelsRGB[t][c] = XMVectorGetByIndex(canvas.texels[t][c], lane);
+            }
+        }
+
+        uint8_t ep7[2][2][3]{};
+        uint8_t pBits[2][2]{};
+        uint8_t unquantEP[2][2][3]{};
+
+        // 1. Quantize endpoints for each subset (7-bit + unique P-bit per endpoint)
+        for (size_t s = 0; s < 2; ++s)
+        {
+            float minC[3] = { 1.0f, 1.0f, 1.0f };
+            float maxC[3] = { 0.0f, 0.0f, 0.0f };
+            bool hasTexels = false;
+
+            for (size_t t = 0; t < 16; ++t)
+            {
+                if (g_bc7PartitionTable2Subsets[partition][t] == s)
+                {
+                    hasTexels = true;
+                    for (size_t c = 0; c < 3; ++c)
+                    {
+                        if (texelsRGB[t][c] < minC[c]) minC[c] = texelsRGB[t][c];
+                        if (texelsRGB[t][c] > maxC[c]) maxC[c] = texelsRGB[t][c];
+                    }
+                }
+            }
+
+            if (!hasTexels)
+            {
+                minC[0] = minC[1] = minC[2] = 0.0f;
+                maxC[0] = maxC[1] = maxC[2] = 0.0f;
+            }
+
+            // In Mode 3, 7-bit + P-bit gives an 8-bit value directly: (val7 << 1) | pBit
+            for (size_t c = 0; c < 3; ++c)
+            {
+                const int q0 = std::min(255, std::max(0, static_cast<int>(std::round(minC[c] * 255.0f))));
+                const int q1 = std::min(255, std::max(0, static_cast<int>(std::round(maxC[c] * 255.0f))));
+                ep7[s][0][c] = static_cast<uint8_t>(q0 >> 1);
+                ep7[s][1][c] = static_cast<uint8_t>(q1 >> 1);
+                pBits[s][0] = static_cast<uint8_t>(q0 & 1);
+                pBits[s][1] = static_cast<uint8_t>(q1 & 1);
+
+                unquantEP[s][0][c] = UnquantizeBC7_7BitScalar(ep7[s][0][c], pBits[s][0]);
+                unquantEP[s][1][c] = UnquantizeBC7_7BitScalar(ep7[s][1][c], pBits[s][1]);
+            }
+        }
+
+        // 2. Build 4-color palette for each subset (2-bit weights: { 0, 21, 43, 64 })
+        constexpr uint32_t weights[4] = { 0, 21, 43, 64 };
+        float palette[2][4][3];
+        for (size_t s = 0; s < 2; ++s)
+        {
+            for (uint32_t k = 0; k < 4; ++k)
+            {
+                for (size_t c = 0; c < 3; ++c)
+                {
+                    const uint32_t val = ((64u - weights[k]) * unquantEP[s][0][c] + weights[k] * unquantEP[s][1][c] + 32u) >> 6;
+                    palette[s][k][c] = static_cast<float>(val) / 255.0f;
+                }
+            }
+        }
+
+        // 3. Assign nearest index and accumulate reconstruction error
+        uint8_t indices[16]{};
+        float totalError = 0.0f;
+
+        for (size_t t = 0; t < 16; ++t)
+        {
+            const size_t s = g_bc7PartitionTable2Subsets[partition][t];
+            float bestDist = 1e10f;
+            uint8_t bestK = 0;
+
+            for (uint8_t k = 0; k < 4; ++k)
+            {
+                float d = 0.0f;
+                for (size_t c = 0; c < 3; ++c)
+                {
+                    const float diff = texelsRGB[t][c] - palette[s][k][c];
+                    d += diff * diff;
+                }
+                if (d < bestDist)
+                {
+                    bestDist = d;
+                    bestK = k;
+                }
+            }
+
+            indices[t] = bestK;
+            totalError += bestDist;
+        }
+
+        // 4. Anchor constraints:
+        // Subset 0 anchor: texel 0. 1 bit (index <= 1).
+        if (indices[0] >= 2)
+        {
+            for (size_t c = 0; c < 3; ++c)
+            {
+                std::swap(ep7[0][0][c], ep7[0][1][c]);
+            }
+            std::swap(pBits[0][0], pBits[0][1]);
+            for (size_t t = 0; t < 16; ++t)
+            {
+                if (g_bc7PartitionTable2Subsets[partition][t] == 0)
+                {
+                    indices[t] = static_cast<uint8_t>(3u - indices[t]);
+                }
+            }
+        }
+
+        // Subset 1 anchor: texel anchor1. 1 bit (index <= 1).
+        const uint8_t anchor1 = g_bc7FixUp2Subsets[partition];
+        if (indices[anchor1] >= 2)
+        {
+            for (size_t c = 0; c < 3; ++c)
+            {
+                std::swap(ep7[1][0][c], ep7[1][1][c]);
+            }
+            std::swap(pBits[1][0], pBits[1][1]);
+            for (size_t t = 0; t < 16; ++t)
+            {
+                if (g_bc7PartitionTable2Subsets[partition][t] == 1)
+                {
+                    indices[t] = static_cast<uint8_t>(3u - indices[t]);
+                }
+            }
+        }
+
+        // 5. Emit 128-bit block
+        BC7Mode3FitResult result{};
+        result.block = EmitBC7Mode3BlockScalar(partition, ep7, pBits, indices);
+        result.totalError = totalError;
+        return result;
+    }
+
+    struct BC7Mode0FitResult
+    {
+        XMUINT4 block;
+        float totalError;
+    };
+
+    // Pack Mode 0 fields into one 128-bit BC7 block.
+    inline XMUINT4 EmitBC7Mode0BlockScalar(
+        uint32_t partition,
+        const uint8_t ep[3][2][3], // [subset 0..2][ep 0..1][rgb 0..2] (4-bit values)
+        const uint8_t pBit[3][2],  // [subset 0..2][ep 0..1]
+        const uint8_t indices[16]) noexcept
+    {
+        uint8_t bytes[16]{};
+        size_t bitOffset = 0;
+
+        // Mode 0 prefix: 0b1 (bit 0 = 1) -> 1 bit
+        WriteBC7Bits(bytes, bitOffset, 1, 1);
+
+        // Partition: 4 bits
+        WriteBC7Bits(bytes, bitOffset, partition, 4);
+
+        // Endpoints (R, G, B order, subset 0 ep 0..1, subset 1 ep 0..1, subset 2 ep 0..1)
+        for (size_t c = 0; c < 3; ++c)
+        {
+            for (size_t s = 0; s < 3; ++s)
+            {
+                WriteBC7Bits(bytes, bitOffset, ep[s][0][c], 4);
+                WriteBC7Bits(bytes, bitOffset, ep[s][1][c], 4);
+            }
+        }
+
+        // P-bits: 6 bits (subset 0 ep 0..1, subset 1 ep 0..1, subset 2 ep 0..1)
+        for (size_t s = 0; s < 3; ++s)
+        {
+            WriteBC7Bits(bytes, bitOffset, pBit[s][0], 1);
+            WriteBC7Bits(bytes, bitOffset, pBit[s][1], 1);
+        }
+
+        // Indices (3 bits each, except 3 anchor texels which have 2 bits)
+        const uint8_t anchor1 = g_bc7FixUp3Subsets[partition][0];
+        const uint8_t anchor2 = g_bc7FixUp3Subsets[partition][1];
+
+        for (size_t t = 0; t < 16; ++t)
+        {
+            const size_t bitCount = (t == 0 || t == anchor1 || t == anchor2) ? 2 : 3;
+            WriteBC7Bits(bytes, bitOffset, indices[t], bitCount);
+        }
+
+        assert(bitOffset == 128);
+
+        XMUINT4 result;
+        memcpy(&result, bytes, sizeof(result));
+        return result;
+    }
+
+    // Fit Mode 0 endpoints and 3-bit indices for a single lane, returning 128-bit block and exact reconstruction error.
+    inline BC7Mode0FitResult FitBC7Mode0SingleLane(
+        const BC7ChildCanvas& canvas,
+        uint32_t partition,
+        size_t lane) noexcept
+    {
+        alignas(16) float texelsRGB[16][3];
+        for (size_t t = 0; t < 16; ++t)
+        {
+            for (size_t c = 0; c < 3; ++c)
+            {
+                texelsRGB[t][c] = XMVectorGetByIndex(canvas.texels[t][c], lane);
+            }
+        }
+
+        uint8_t ep4[3][2][3]{};
+        uint8_t pBits[3][2]{};
+        uint8_t unquantEP[3][2][3]{};
+
+        // 1. Quantize endpoints for each of the 3 subsets (4-bit + 1 P-bit per endpoint = 5 bits: [0, 31])
+        for (size_t s = 0; s < 3; ++s)
+        {
+            float minC[3] = { 1.0f, 1.0f, 1.0f };
+            float maxC[3] = { 0.0f, 0.0f, 0.0f };
+            bool hasTexels = false;
+
+            for (size_t t = 0; t < 16; ++t)
+            {
+                if (g_bc7PartitionTable3Subsets[partition][t] == s)
+                {
+                    hasTexels = true;
+                    for (size_t c = 0; c < 3; ++c)
+                    {
+                        if (texelsRGB[t][c] < minC[c]) minC[c] = texelsRGB[t][c];
+                        if (texelsRGB[t][c] > maxC[c]) maxC[c] = texelsRGB[t][c];
+                    }
+                }
+            }
+
+            if (!hasTexels)
+            {
+                minC[0] = minC[1] = minC[2] = 0.0f;
+                maxC[0] = maxC[1] = maxC[2] = 0.0f;
+            }
+
+            for (size_t c = 0; c < 3; ++c)
+            {
+                const int q0 = std::min(31, std::max(0, static_cast<int>(std::round(minC[c] * 31.0f))));
+                const int q1 = std::min(31, std::max(0, static_cast<int>(std::round(maxC[c] * 31.0f))));
+                ep4[s][0][c] = static_cast<uint8_t>(q0 >> 1);
+                ep4[s][1][c] = static_cast<uint8_t>(q1 >> 1);
+                pBits[s][0] = static_cast<uint8_t>(q0 & 1);
+                pBits[s][1] = static_cast<uint8_t>(q1 & 1);
+
+                unquantEP[s][0][c] = UnquantizeBC7_4BitScalar(ep4[s][0][c], pBits[s][0]);
+                unquantEP[s][1][c] = UnquantizeBC7_4BitScalar(ep4[s][1][c], pBits[s][1]);
+            }
+        }
+
+        // 2. Build 8-color palette for each subset (3-bit weights)
+        constexpr uint32_t weights[8] = { 0, 9, 18, 27, 37, 46, 55, 64 };
+        float palette[3][8][3];
+        for (size_t s = 0; s < 3; ++s)
+        {
+            for (uint32_t k = 0; k < 8; ++k)
+            {
+                for (size_t c = 0; c < 3; ++c)
+                {
+                    const uint32_t val = ((64u - weights[k]) * unquantEP[s][0][c] + weights[k] * unquantEP[s][1][c] + 32u) >> 6;
+                    palette[s][k][c] = static_cast<float>(val) / 255.0f;
+                }
+            }
+        }
+
+        // 3. Assign nearest index and accumulate error
+        uint8_t indices[16]{};
+        float totalError = 0.0f;
+
+        for (size_t t = 0; t < 16; ++t)
+        {
+            const size_t s = g_bc7PartitionTable3Subsets[partition][t];
+            float bestDist = 1e10f;
+            uint8_t bestK = 0;
+
+            for (uint8_t k = 0; k < 8; ++k)
+            {
+                float d = 0.0f;
+                for (size_t c = 0; c < 3; ++c)
+                {
+                    const float diff = texelsRGB[t][c] - palette[s][k][c];
+                    d += diff * diff;
+                }
+                if (d < bestDist)
+                {
+                    bestDist = d;
+                    bestK = k;
+                }
+            }
+
+            indices[t] = bestK;
+            totalError += bestDist;
+        }
+
+        // 4. Anchor constraints: 3 anchors (texel 0, anchor1, anchor2). MSB must be 0 (index <= 3).
+        const uint8_t anchors[3] = { 0, g_bc7FixUp3Subsets[partition][0], g_bc7FixUp3Subsets[partition][1] };
+        for (size_t s = 0; s < 3; ++s)
+        {
+            const uint8_t a = anchors[s];
+            if (indices[a] >= 4)
+            {
+                for (size_t c = 0; c < 3; ++c)
+                {
+                    std::swap(ep4[s][0][c], ep4[s][1][c]);
+                }
+                std::swap(pBits[s][0], pBits[s][1]);
+                for (size_t t = 0; t < 16; ++t)
+                {
+                    if (g_bc7PartitionTable3Subsets[partition][t] == s)
+                    {
+                        indices[t] = static_cast<uint8_t>(7u - indices[t]);
+                    }
+                }
+            }
+        }
+
+        BC7Mode0FitResult result{};
+        result.block = EmitBC7Mode0BlockScalar(partition, ep4, pBits, indices);
+        result.totalError = totalError;
+        return result;
+    }
+
+    struct BC7Mode2FitResult
+    {
+        XMUINT4 block;
+        float totalError;
+    };
+
+    // Pack Mode 2 fields into one 128-bit BC7 block.
+    inline XMUINT4 EmitBC7Mode2BlockScalar(
+        uint32_t partition,
+        const uint8_t ep[3][2][3], // [subset 0..2][ep 0..1][rgb 0..2] (5-bit values)
+        const uint8_t indices[16]) noexcept
+    {
+        uint8_t bytes[16]{};
+        size_t bitOffset = 0;
+
+        // Mode 2 prefix: 0b100 (bit 0..1 = 0, bit 2 = 1) -> 3 bits
+        WriteBC7Bits(bytes, bitOffset, 0b100, 3);
+
+        // Partition: 6 bits
+        WriteBC7Bits(bytes, bitOffset, partition, 6);
+
+        // Endpoints (R, G, B order, subset 0 ep 0..1, subset 1 ep 0..1, subset 2 ep 0..1)
+        for (size_t c = 0; c < 3; ++c)
+        {
+            for (size_t s = 0; s < 3; ++s)
+            {
+                WriteBC7Bits(bytes, bitOffset, ep[s][0][c], 5);
+                WriteBC7Bits(bytes, bitOffset, ep[s][1][c], 5);
+            }
+        }
+
+        // Indices (2 bits each, except 3 anchor texels which have 1 bit)
+        const uint8_t anchor1 = g_bc7FixUp3Subsets[partition][0];
+        const uint8_t anchor2 = g_bc7FixUp3Subsets[partition][1];
+
+        for (size_t t = 0; t < 16; ++t)
+        {
+            const size_t bitCount = (t == 0 || t == anchor1 || t == anchor2) ? 1 : 2;
+            WriteBC7Bits(bytes, bitOffset, indices[t], bitCount);
+        }
+
+        assert(bitOffset == 128);
+
+        XMUINT4 result;
+        memcpy(&result, bytes, sizeof(result));
+        return result;
+    }
+
+    // Fit Mode 2 endpoints and 2-bit indices for a single lane, returning 128-bit block and exact reconstruction error.
+    inline BC7Mode2FitResult FitBC7Mode2SingleLane(
+        const BC7ChildCanvas& canvas,
+        uint32_t partition,
+        size_t lane) noexcept
+    {
+        alignas(16) float texelsRGB[16][3];
+        for (size_t t = 0; t < 16; ++t)
+        {
+            for (size_t c = 0; c < 3; ++c)
+            {
+                texelsRGB[t][c] = XMVectorGetByIndex(canvas.texels[t][c], lane);
+            }
+        }
+
+        uint8_t ep5[3][2][3]{};
+        uint8_t unquantEP[3][2][3]{};
+
+        // 1. Quantize endpoints for each of the 3 subsets (5-bit without P-bit: [0, 31])
+        for (size_t s = 0; s < 3; ++s)
+        {
+            float minC[3] = { 1.0f, 1.0f, 1.0f };
+            float maxC[3] = { 0.0f, 0.0f, 0.0f };
+            bool hasTexels = false;
+
+            for (size_t t = 0; t < 16; ++t)
+            {
+                if (g_bc7PartitionTable3Subsets[partition][t] == s)
+                {
+                    hasTexels = true;
+                    for (size_t c = 0; c < 3; ++c)
+                    {
+                        if (texelsRGB[t][c] < minC[c]) minC[c] = texelsRGB[t][c];
+                        if (texelsRGB[t][c] > maxC[c]) maxC[c] = texelsRGB[t][c];
+                    }
+                }
+            }
+
+            if (!hasTexels)
+            {
+                minC[0] = minC[1] = minC[2] = 0.0f;
+                maxC[0] = maxC[1] = maxC[2] = 0.0f;
+            }
+
+            for (size_t c = 0; c < 3; ++c)
+            {
+                ep5[s][0][c] = static_cast<uint8_t>(std::min(31, std::max(0, static_cast<int>(std::round(minC[c] * 31.0f)))));
+                ep5[s][1][c] = static_cast<uint8_t>(std::min(31, std::max(0, static_cast<int>(std::round(maxC[c] * 31.0f)))));
+
+                unquantEP[s][0][c] = UnquantizeBC7_5Bit_NoPBitScalar(ep5[s][0][c]);
+                unquantEP[s][1][c] = UnquantizeBC7_5Bit_NoPBitScalar(ep5[s][1][c]);
+            }
+        }
+
+        // 2. Build 4-color palette for each subset (2-bit weights: { 0, 21, 43, 64 })
+        constexpr uint32_t weights[4] = { 0, 21, 43, 64 };
+        float palette[3][4][3];
+        for (size_t s = 0; s < 3; ++s)
+        {
+            for (uint32_t k = 0; k < 4; ++k)
+            {
+                for (size_t c = 0; c < 3; ++c)
+                {
+                    const uint32_t val = ((64u - weights[k]) * unquantEP[s][0][c] + weights[k] * unquantEP[s][1][c] + 32u) >> 6;
+                    palette[s][k][c] = static_cast<float>(val) / 255.0f;
+                }
+            }
+        }
+
+        // 3. Assign nearest index and accumulate error
+        uint8_t indices[16]{};
+        float totalError = 0.0f;
+
+        for (size_t t = 0; t < 16; ++t)
+        {
+            const size_t s = g_bc7PartitionTable3Subsets[partition][t];
+            float bestDist = 1e10f;
+            uint8_t bestK = 0;
+
+            for (uint8_t k = 0; k < 4; ++k)
+            {
+                float d = 0.0f;
+                for (size_t c = 0; c < 3; ++c)
+                {
+                    const float diff = texelsRGB[t][c] - palette[s][k][c];
+                    d += diff * diff;
+                }
+                if (d < bestDist)
+                {
+                    bestDist = d;
+                    bestK = k;
+                }
+            }
+
+            indices[t] = bestK;
+            totalError += bestDist;
+        }
+
+        // 4. Anchor constraints: 3 anchors (texel 0, anchor1, anchor2). MSB must be 0 (index <= 1).
+        const uint8_t anchors[3] = { 0, g_bc7FixUp3Subsets[partition][0], g_bc7FixUp3Subsets[partition][1] };
+        for (size_t s = 0; s < 3; ++s)
+        {
+            const uint8_t a = anchors[s];
+            if (indices[a] >= 2)
+            {
+                for (size_t c = 0; c < 3; ++c)
+                {
+                    std::swap(ep5[s][0][c], ep5[s][1][c]);
+                }
+                for (size_t t = 0; t < 16; ++t)
+                {
+                    if (g_bc7PartitionTable3Subsets[partition][t] == s)
+                    {
+                        indices[t] = static_cast<uint8_t>(3u - indices[t]);
+                    }
+                }
+            }
+        }
+
+        BC7Mode2FitResult result{};
+        result.block = EmitBC7Mode2BlockScalar(partition, ep5, indices);
+        result.totalError = totalError;
+        return result;
+    }
+
+    struct BC7Mode7FitResult
+    {
+        XMUINT4 block;
+        float totalError;
+    };
+
+    // Pack Mode 7 fields into one 128-bit BC7 block.
+    inline XMUINT4 EmitBC7Mode7BlockScalar(
+        uint32_t partition,
+        const uint8_t ep[2][2][4], // [subset 0..1][ep 0..1][rgba 0..3] (5-bit values)
+        const uint8_t pBit[2][2],  // [subset 0..1][ep 0..1]
+        const uint8_t indices[16]) noexcept
+    {
+        uint8_t bytes[16]{};
+        size_t bitOffset = 0;
+
+        // Mode 7 prefix: 0b10000000 (bit 0..6 = 0, bit 7 = 1) -> 8 bits
+        WriteBC7Bits(bytes, bitOffset, 0b10000000, 8);
+
+        // Partition: 6 bits
+        WriteBC7Bits(bytes, bitOffset, partition, 6);
+
+        // Endpoints (R, G, B, A order, subset 0 ep 0..1, subset 1 ep 0..1)
+        for (size_t c = 0; c < 4; ++c)
+        {
+            WriteBC7Bits(bytes, bitOffset, ep[0][0][c], 5);
+            WriteBC7Bits(bytes, bitOffset, ep[0][1][c], 5);
+            WriteBC7Bits(bytes, bitOffset, ep[1][0][c], 5);
+            WriteBC7Bits(bytes, bitOffset, ep[1][1][c], 5);
+        }
+
+        // P-bits: 4 bits (subset 0 ep 0..1, subset 1 ep 0..1)
+        WriteBC7Bits(bytes, bitOffset, pBit[0][0], 1);
+        WriteBC7Bits(bytes, bitOffset, pBit[0][1], 1);
+        WriteBC7Bits(bytes, bitOffset, pBit[1][0], 1);
+        WriteBC7Bits(bytes, bitOffset, pBit[1][1], 1);
+
+        // Indices (2 bits each, except anchor texels which have 1 bit)
+        const uint8_t anchor1 = g_bc7FixUp2Subsets[partition];
+
+        for (size_t t = 0; t < 16; ++t)
+        {
+            const size_t bitCount = (t == 0 || t == anchor1) ? 1 : 2;
+            WriteBC7Bits(bytes, bitOffset, indices[t], bitCount);
+        }
+
+        assert(bitOffset == 128);
+
+        XMUINT4 result;
+        memcpy(&result, bytes, sizeof(result));
+        return result;
+    }
+
+    // Fit Mode 7 endpoints and 2-bit indices for a single lane, returning 128-bit block and exact reconstruction error.
+    inline BC7Mode7FitResult FitBC7Mode7SingleLane(
+        const BC7ChildCanvas& canvas,
+        uint32_t partition,
+        size_t lane) noexcept
+    {
+        alignas(16) float texelsRGBA[16][4];
+        for (size_t t = 0; t < 16; ++t)
+        {
+            for (size_t c = 0; c < 4; ++c)
+            {
+                texelsRGBA[t][c] = XMVectorGetByIndex(canvas.texels[t][c], lane);
+            }
+        }
+
+        uint8_t ep5[2][2][4]{};
+        uint8_t pBits[2][2]{};
+        uint8_t unquantEP[2][2][4]{};
+
+        // 1. Quantize endpoints for each of the 2 subsets (5-bit + 1 P-bit per endpoint = 6 bits: [0, 63])
+        for (size_t s = 0; s < 2; ++s)
+        {
+            float minC[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+            float maxC[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+            bool hasTexels = false;
+
+            for (size_t t = 0; t < 16; ++t)
+            {
+                if (g_bc7PartitionTable2Subsets[partition][t] == s)
+                {
+                    hasTexels = true;
+                    for (size_t c = 0; c < 4; ++c)
+                    {
+                        if (texelsRGBA[t][c] < minC[c]) minC[c] = texelsRGBA[t][c];
+                        if (texelsRGBA[t][c] > maxC[c]) maxC[c] = texelsRGBA[t][c];
+                    }
+                }
+            }
+
+            if (!hasTexels)
+            {
+                minC[0] = minC[1] = minC[2] = minC[3] = 0.0f;
+                maxC[0] = maxC[1] = maxC[2] = maxC[3] = 0.0f;
+            }
+
+            for (size_t c = 0; c < 4; ++c)
+            {
+                const int q0 = std::min(63, std::max(0, static_cast<int>(std::round(minC[c] * 63.0f))));
+                const int q1 = std::min(63, std::max(0, static_cast<int>(std::round(maxC[c] * 63.0f))));
+                ep5[s][0][c] = static_cast<uint8_t>(q0 >> 1);
+                ep5[s][1][c] = static_cast<uint8_t>(q1 >> 1);
+                pBits[s][0] = static_cast<uint8_t>(q0 & 1);
+                pBits[s][1] = static_cast<uint8_t>(q1 & 1);
+
+                unquantEP[s][0][c] = UnquantizeBC7_5BitScalar(ep5[s][0][c], pBits[s][0]);
+                unquantEP[s][1][c] = UnquantizeBC7_5BitScalar(ep5[s][1][c], pBits[s][1]);
+            }
+        }
+
+        // 2. Build 4-color palette for each subset (2-bit weights: { 0, 21, 43, 64 })
+        constexpr uint32_t weights[4] = { 0, 21, 43, 64 };
+        float palette[2][4][4];
+        for (size_t s = 0; s < 2; ++s)
+        {
+            for (uint32_t k = 0; k < 4; ++k)
+            {
+                for (size_t c = 0; c < 4; ++c)
+                {
+                    const uint32_t val = ((64u - weights[k]) * unquantEP[s][0][c] + weights[k] * unquantEP[s][1][c] + 32u) >> 6;
+                    palette[s][k][c] = static_cast<float>(val) / 255.0f;
+                }
+            }
+        }
+
+        // 3. Assign nearest index and accumulate RGBA error
+        uint8_t indices[16]{};
+        float totalError = 0.0f;
+
+        for (size_t t = 0; t < 16; ++t)
+        {
+            const size_t s = g_bc7PartitionTable2Subsets[partition][t];
+            float bestDist = 1e10f;
+            uint8_t bestK = 0;
+
+            for (uint8_t k = 0; k < 4; ++k)
+            {
+                float d = 0.0f;
+                for (size_t c = 0; c < 4; ++c)
+                {
+                    const float diff = texelsRGBA[t][c] - palette[s][k][c];
+                    d += diff * diff;
+                }
+                if (d < bestDist)
+                {
+                    bestDist = d;
+                    bestK = k;
+                }
+            }
+
+            indices[t] = bestK;
+            totalError += bestDist;
+        }
+
+        // 4. Anchor constraints:
+        // Subset 0 anchor: texel 0. 1 bit (index <= 1).
+        if (indices[0] >= 2)
+        {
+            for (size_t c = 0; c < 4; ++c)
+            {
+                std::swap(ep5[0][0][c], ep5[0][1][c]);
+            }
+            std::swap(pBits[0][0], pBits[0][1]);
+            for (size_t t = 0; t < 16; ++t)
+            {
+                if (g_bc7PartitionTable2Subsets[partition][t] == 0)
+                {
+                    indices[t] = static_cast<uint8_t>(3u - indices[t]);
+                }
+            }
+        }
+
+        // Subset 1 anchor: texel anchor1. 1 bit (index <= 1).
+        const uint8_t anchor1 = g_bc7FixUp2Subsets[partition];
+        if (indices[anchor1] >= 2)
+        {
+            for (size_t c = 0; c < 4; ++c)
+            {
+                std::swap(ep5[1][0][c], ep5[1][1][c]);
+            }
+            std::swap(pBits[1][0], pBits[1][1]);
+            for (size_t t = 0; t < 16; ++t)
+            {
+                if (g_bc7PartitionTable2Subsets[partition][t] == 1)
+                {
+                    indices[t] = static_cast<uint8_t>(3u - indices[t]);
+                }
+            }
+        }
+
+        BC7Mode7FitResult result{};
+        result.block = EmitBC7Mode7BlockScalar(partition, ep5, pBits, indices);
+        result.totalError = totalError;
+        return result;
+    }
+
+    struct BC7Mode4FitResult
+    {
+        XMUINT4 block;
+        float totalError;
+    };
+
+    // Pack Mode 4 fields into one 128-bit BC7 block.
+    inline XMUINT4 EmitBC7Mode4BlockScalar(
+        const uint8_t epRGB[2][3], // [ep 0..1][rgb 0..2] (5-bit values)
+        const uint8_t epA[2],      // [ep 0..1] (6-bit values)
+        const uint8_t colorIndices[16], // 2-bit indices
+        const uint8_t alphaIndices[16]) // 3-bit indices
+    {
+        uint8_t bytes[16]{};
+        size_t bitOffset = 0;
+
+        // Mode 4 prefix: 0b10000 (bit 0..3 = 0, bit 4 = 1) -> 5 bits
+        WriteBC7Bits(bytes, bitOffset, 0b10000, 5);
+
+        // Rotation: 2 bits (0)
+        WriteBC7Bits(bytes, bitOffset, 0, 2);
+
+        // Index Mode: 1 bit (0 = 2-bit RGB, 3-bit Alpha)
+        WriteBC7Bits(bytes, bitOffset, 0, 1);
+
+        // Endpoints RGB (5 bits each: r0, r1, g0, g1, b0, b1)
+        for (size_t c = 0; c < 3; ++c)
+        {
+            WriteBC7Bits(bytes, bitOffset, epRGB[0][c], 5);
+            WriteBC7Bits(bytes, bitOffset, epRGB[1][c], 5);
+        }
+
+        // Endpoints Alpha (6 bits each: a0, a1)
+        WriteBC7Bits(bytes, bitOffset, epA[0], 6);
+        WriteBC7Bits(bytes, bitOffset, epA[1], 6);
+
+        // Stream 0: Color indices (texel 0 is 1 bit, others 2 bits)
+        for (size_t t = 0; t < 16; ++t)
+        {
+            const size_t bitCount = (t == 0) ? 1 : 2;
+            WriteBC7Bits(bytes, bitOffset, colorIndices[t], bitCount);
+        }
+
+        // Stream 1: Alpha indices (texel 0 is 2 bits, others 3 bits)
+        for (size_t t = 0; t < 16; ++t)
+        {
+            const size_t bitCount = (t == 0) ? 2 : 3;
+            WriteBC7Bits(bytes, bitOffset, alphaIndices[t], bitCount);
+        }
+
+        assert(bitOffset == 128);
+
+        XMUINT4 result;
+        memcpy(&result, bytes, sizeof(result));
+        return result;
+    }
+
+    // Fit Mode 4 endpoints and dual indices for a single lane, returning 128-bit block and exact reconstruction error.
+    inline BC7Mode4FitResult FitBC7Mode4SingleLane(
+        const BC7ChildCanvas& canvas,
+        size_t lane) noexcept
+    {
+        alignas(16) float texelsRGBA[16][4];
+        for (size_t t = 0; t < 16; ++t)
+        {
+            for (size_t c = 0; c < 4; ++c)
+            {
+                texelsRGBA[t][c] = XMVectorGetByIndex(canvas.texels[t][c], lane);
+            }
+        }
+
+        // 1. Color: 5-bit endpoints without P-bit, 2-bit palette (weights: {0, 21, 43, 64})
+        float minRGB[3] = { 1.0f, 1.0f, 1.0f };
+        float maxRGB[3] = { 0.0f, 0.0f, 0.0f };
+        for (size_t t = 0; t < 16; ++t)
+        {
+            for (size_t c = 0; c < 3; ++c)
+            {
+                if (texelsRGBA[t][c] < minRGB[c]) minRGB[c] = texelsRGBA[t][c];
+                if (texelsRGBA[t][c] > maxRGB[c]) maxRGB[c] = texelsRGBA[t][c];
+            }
+        }
+
+        uint8_t epRGB[2][3]{};
+        uint8_t unquantRGB[2][3]{};
+        for (size_t c = 0; c < 3; ++c)
+        {
+            epRGB[0][c] = static_cast<uint8_t>(std::min(31, std::max(0, static_cast<int>(std::round(minRGB[c] * 31.0f)))));
+            epRGB[1][c] = static_cast<uint8_t>(std::min(31, std::max(0, static_cast<int>(std::round(maxRGB[c] * 31.0f)))));
+            unquantRGB[0][c] = UnquantizeBC7_5Bit_NoPBitScalar(epRGB[0][c]);
+            unquantRGB[1][c] = UnquantizeBC7_5Bit_NoPBitScalar(epRGB[1][c]);
+        }
+
+        constexpr uint32_t weights2Bit[4] = { 0, 21, 43, 64 };
+        float paletteRGB[4][3];
+        for (uint32_t k = 0; k < 4; ++k)
+        {
+            for (size_t c = 0; c < 3; ++c)
+            {
+                const uint32_t val = ((64u - weights2Bit[k]) * unquantRGB[0][c] + weights2Bit[k] * unquantRGB[1][c] + 32u) >> 6;
+                paletteRGB[k][c] = static_cast<float>(val) / 255.0f;
+            }
+        }
+
+        uint8_t colorIndices[16]{};
+        float colorError = 0.0f;
+        for (size_t t = 0; t < 16; ++t)
+        {
+            float bestDist = 1e10f;
+            uint8_t bestK = 0;
+            for (uint8_t k = 0; k < 4; ++k)
+            {
+                float d = 0.0f;
+                for (size_t c = 0; c < 3; ++c)
+                {
+                    const float diff = texelsRGBA[t][c] - paletteRGB[k][c];
+                    d += diff * diff;
+                }
+                if (d < bestDist)
+                {
+                    bestDist = d;
+                    bestK = k;
+                }
+            }
+            colorIndices[t] = bestK;
+            colorError += bestDist;
+        }
+
+        if (colorIndices[0] >= 2)
+        {
+            for (size_t c = 0; c < 3; ++c)
+            {
+                std::swap(epRGB[0][c], epRGB[1][c]);
+            }
+            for (size_t t = 0; t < 16; ++t)
+            {
+                colorIndices[t] = static_cast<uint8_t>(3u - colorIndices[t]);
+            }
+        }
+
+        // 2. Alpha: 6-bit endpoints without P-bit, 3-bit palette (weights: {0, 9, 18, 27, 37, 46, 55, 64})
+        float minA = 1.0f;
+        float maxA = 0.0f;
+        for (size_t t = 0; t < 16; ++t)
+        {
+            if (texelsRGBA[t][3] < minA) minA = texelsRGBA[t][3];
+            if (texelsRGBA[t][3] > maxA) maxA = texelsRGBA[t][3];
+        }
+
+        uint8_t epA[2]{};
+        epA[0] = static_cast<uint8_t>(std::min(63, std::max(0, static_cast<int>(std::round(minA * 63.0f)))));
+        epA[1] = static_cast<uint8_t>(std::min(63, std::max(0, static_cast<int>(std::round(maxA * 63.0f)))));
+        const uint8_t unquantA0 = UnquantizeBC7_6Bit_NoPBitScalar(epA[0]);
+        const uint8_t unquantA1 = UnquantizeBC7_6Bit_NoPBitScalar(epA[1]);
+
+        constexpr uint32_t weights3Bit[8] = { 0, 9, 18, 27, 37, 46, 55, 64 };
+        float paletteA[8];
+        for (uint32_t k = 0; k < 8; ++k)
+        {
+            const uint32_t val = ((64u - weights3Bit[k]) * unquantA0 + weights3Bit[k] * unquantA1 + 32u) >> 6;
+            paletteA[k] = static_cast<float>(val) / 255.0f;
+        }
+
+        uint8_t alphaIndices[16]{};
+        float alphaError = 0.0f;
+        for (size_t t = 0; t < 16; ++t)
+        {
+            float bestDist = 1e10f;
+            uint8_t bestK = 0;
+            for (uint8_t k = 0; k < 8; ++k)
+            {
+                const float diff = texelsRGBA[t][3] - paletteA[k];
+                const float d = diff * diff;
+                if (d < bestDist)
+                {
+                    bestDist = d;
+                    bestK = k;
+                }
+            }
+            alphaIndices[t] = bestK;
+            alphaError += bestDist;
+        }
+
+        if (alphaIndices[0] >= 4)
+        {
+            std::swap(epA[0], epA[1]);
+            for (size_t t = 0; t < 16; ++t)
+            {
+                alphaIndices[t] = static_cast<uint8_t>(7u - alphaIndices[t]);
+            }
+        }
+
+        BC7Mode4FitResult result{};
+        result.block = EmitBC7Mode4BlockScalar(epRGB, epA, colorIndices, alphaIndices);
+        result.totalError = colorError + alphaError;
+        return result;
+    }
+
+    struct BC7Mode5FitResult
+    {
+        XMUINT4 block;
+        float totalError;
+    };
+
+    // Pack Mode 5 fields into one 128-bit BC7 block.
+    inline XMUINT4 EmitBC7Mode5BlockScalar(
+        const uint8_t epRGB[2][3], // [ep 0..1][rgb 0..2] (7-bit values)
+        const uint8_t epA[2],      // [ep 0..1] (8-bit values)
+        const uint8_t colorIndices[16], // 2-bit indices
+        const uint8_t alphaIndices[16]) // 2-bit indices
+    {
+        uint8_t bytes[16]{};
+        size_t bitOffset = 0;
+
+        // Mode 5 prefix: 0b100000 (bit 0..4 = 0, bit 5 = 1) -> 6 bits
+        WriteBC7Bits(bytes, bitOffset, 0b100000, 6);
+
+        // Rotation: 2 bits (0)
+        WriteBC7Bits(bytes, bitOffset, 0, 2);
+
+        // Endpoints RGB (7 bits each: r0, r1, g0, g1, b0, b1)
+        for (size_t c = 0; c < 3; ++c)
+        {
+            WriteBC7Bits(bytes, bitOffset, epRGB[0][c], 7);
+            WriteBC7Bits(bytes, bitOffset, epRGB[1][c], 7);
+        }
+
+        // Endpoints Alpha (8 bits each: a0, a1)
+        WriteBC7Bits(bytes, bitOffset, epA[0], 8);
+        WriteBC7Bits(bytes, bitOffset, epA[1], 8);
+
+        // Stream 0: Color indices (texel 0 is 1 bit, others 2 bits)
+        for (size_t t = 0; t < 16; ++t)
+        {
+            const size_t bitCount = (t == 0) ? 1 : 2;
+            WriteBC7Bits(bytes, bitOffset, colorIndices[t], bitCount);
+        }
+
+        // Stream 1: Alpha indices (texel 0 is 1 bit, others 2 bits)
+        for (size_t t = 0; t < 16; ++t)
+        {
+            const size_t bitCount = (t == 0) ? 1 : 2;
+            WriteBC7Bits(bytes, bitOffset, alphaIndices[t], bitCount);
+        }
+
+        assert(bitOffset == 128);
+
+        XMUINT4 result;
+        memcpy(&result, bytes, sizeof(result));
+        return result;
+    }
+
+    // Fit Mode 5 endpoints and dual 2-bit indices for a single lane, returning 128-bit block and exact reconstruction error.
+    inline BC7Mode5FitResult FitBC7Mode5SingleLane(
+        const BC7ChildCanvas& canvas,
+        size_t lane) noexcept
+    {
+        alignas(16) float texelsRGBA[16][4];
+        for (size_t t = 0; t < 16; ++t)
+        {
+            for (size_t c = 0; c < 4; ++c)
+            {
+                texelsRGBA[t][c] = XMVectorGetByIndex(canvas.texels[t][c], lane);
+            }
+        }
+
+        // 1. Color: 7-bit endpoints without P-bit, 2-bit palette (weights: {0, 21, 43, 64})
+        float minRGB[3] = { 1.0f, 1.0f, 1.0f };
+        float maxRGB[3] = { 0.0f, 0.0f, 0.0f };
+        for (size_t t = 0; t < 16; ++t)
+        {
+            for (size_t c = 0; c < 3; ++c)
+            {
+                if (texelsRGBA[t][c] < minRGB[c]) minRGB[c] = texelsRGBA[t][c];
+                if (texelsRGBA[t][c] > maxRGB[c]) maxRGB[c] = texelsRGBA[t][c];
+            }
+        }
+
+        uint8_t epRGB[2][3]{};
+        uint8_t unquantRGB[2][3]{};
+        for (size_t c = 0; c < 3; ++c)
+        {
+            epRGB[0][c] = static_cast<uint8_t>(std::min(127, std::max(0, static_cast<int>(std::round(minRGB[c] * 127.0f)))));
+            epRGB[1][c] = static_cast<uint8_t>(std::min(127, std::max(0, static_cast<int>(std::round(maxRGB[c] * 127.0f)))));
+            unquantRGB[0][c] = UnquantizeBC7_7Bit_NoPBitScalar(epRGB[0][c]);
+            unquantRGB[1][c] = UnquantizeBC7_7Bit_NoPBitScalar(epRGB[1][c]);
+        }
+
+        constexpr uint32_t weights2Bit[4] = { 0, 21, 43, 64 };
+        float paletteRGB[4][3];
+        for (uint32_t k = 0; k < 4; ++k)
+        {
+            for (size_t c = 0; c < 3; ++c)
+            {
+                const uint32_t val = ((64u - weights2Bit[k]) * unquantRGB[0][c] + weights2Bit[k] * unquantRGB[1][c] + 32u) >> 6;
+                paletteRGB[k][c] = static_cast<float>(val) / 255.0f;
+            }
+        }
+
+        uint8_t colorIndices[16]{};
+        float colorError = 0.0f;
+        for (size_t t = 0; t < 16; ++t)
+        {
+            float bestDist = 1e10f;
+            uint8_t bestK = 0;
+            for (uint8_t k = 0; k < 4; ++k)
+            {
+                float d = 0.0f;
+                for (size_t c = 0; c < 3; ++c)
+                {
+                    const float diff = texelsRGBA[t][c] - paletteRGB[k][c];
+                    d += diff * diff;
+                }
+                if (d < bestDist)
+                {
+                    bestDist = d;
+                    bestK = k;
+                }
+            }
+            colorIndices[t] = bestK;
+            colorError += bestDist;
+        }
+
+        if (colorIndices[0] >= 2)
+        {
+            for (size_t c = 0; c < 3; ++c)
+            {
+                std::swap(epRGB[0][c], epRGB[1][c]);
+            }
+            for (size_t t = 0; t < 16; ++t)
+            {
+                colorIndices[t] = static_cast<uint8_t>(3u - colorIndices[t]);
+            }
+        }
+
+        // 2. Alpha: 8-bit endpoints directly, 2-bit palette (weights: {0, 21, 43, 64})
+        float minA = 1.0f;
+        float maxA = 0.0f;
+        for (size_t t = 0; t < 16; ++t)
+        {
+            if (texelsRGBA[t][3] < minA) minA = texelsRGBA[t][3];
+            if (texelsRGBA[t][3] > maxA) maxA = texelsRGBA[t][3];
+        }
+
+        uint8_t epA[2]{};
+        epA[0] = static_cast<uint8_t>(std::min(255, std::max(0, static_cast<int>(std::round(minA * 255.0f)))));
+        epA[1] = static_cast<uint8_t>(std::min(255, std::max(0, static_cast<int>(std::round(maxA * 255.0f)))));
+
+        float paletteA[4];
+        for (uint32_t k = 0; k < 4; ++k)
+        {
+            const uint32_t val = ((64u - weights2Bit[k]) * epA[0] + weights2Bit[k] * epA[1] + 32u) >> 6;
+            paletteA[k] = static_cast<float>(val) / 255.0f;
+        }
+
+        uint8_t alphaIndices[16]{};
+        float alphaError = 0.0f;
+        for (size_t t = 0; t < 16; ++t)
+        {
+            float bestDist = 1e10f;
+            uint8_t bestK = 0;
+            for (uint8_t k = 0; k < 4; ++k)
+            {
+                const float diff = texelsRGBA[t][3] - paletteA[k];
+                const float d = diff * diff;
+                if (d < bestDist)
+                {
+                    bestDist = d;
+                    bestK = k;
+                }
+            }
+            alphaIndices[t] = bestK;
+            alphaError += bestDist;
+        }
+
+        if (alphaIndices[0] >= 2)
+        {
+            std::swap(epA[0], epA[1]);
+            for (size_t t = 0; t < 16; ++t)
+            {
+                alphaIndices[t] = static_cast<uint8_t>(3u - alphaIndices[t]);
+            }
+        }
+
+        BC7Mode5FitResult result{};
+        result.block = EmitBC7Mode5BlockScalar(epRGB, epA, colorIndices, alphaIndices);
+        result.totalError = colorError + alphaError;
+        return result;
+    }
+
+    // Estimate initial RGBA endpoints for Mode 6 using the canvas principal axis.
+    inline BC7EndpointPairFloatBatch ComputeInitialEndpointsBC7Mode6PCA(const BC7ChildCanvas& canvas) noexcept
+    {
         XMVECTOR minimum = XMVectorReplicate(10000.0f);
         XMVECTOR maximum = XMVectorReplicate(-10000.0f);
 
-        ExpandBC7ParentProjectionRange(p00, axis, mean, minimum, maximum);
-        ExpandBC7ParentProjectionRange(p10, axis, mean, minimum, maximum);
-        ExpandBC7ParentProjectionRange(p01, axis, mean, minimum, maximum);
-        ExpandBC7ParentProjectionRange(p11, axis, mean, minimum, maximum);
+        for (size_t t = 0; t < 16; ++t)
+        {
+            XMVECTOR proj = XMVectorMultiply(canvas.axis.value[0], XMVectorSubtract(canvas.texels[t][0], canvas.mean.value[0]));
+            proj = XMVectorMultiplyAdd(canvas.axis.value[1], XMVectorSubtract(canvas.texels[t][1], canvas.mean.value[1]), proj);
+            proj = XMVectorMultiplyAdd(canvas.axis.value[2], XMVectorSubtract(canvas.texels[t][2], canvas.mean.value[2]), proj);
+            proj = XMVectorMultiplyAdd(canvas.axis.value[3], XMVectorSubtract(canvas.texels[t][3], canvas.mean.value[3]), proj);
+            minimum = XMVectorMin(minimum, proj);
+            maximum = XMVectorMax(maximum, proj);
+        }
 
-        // Convert the two extreme scalar projections back into 4D endpoint candidates.
         BC7EndpointPairFloatBatch result{};
         for (size_t c = 0; c < 4; ++c)
         {
-            result.value[0][c] = XMVectorMultiplyAdd(axis.value[c], minimum, mean.value[c]);
-            result.value[1][c] = XMVectorMultiplyAdd(axis.value[c], maximum, mean.value[c]);
+            result.value[0][c] = XMVectorMultiplyAdd(canvas.axis.value[c], minimum, canvas.mean.value[c]);
+            result.value[1][c] = XMVectorMultiplyAdd(canvas.axis.value[c], maximum, canvas.mean.value[c]);
         }
 
         return result;
@@ -2199,52 +4810,12 @@ namespace // for bc7
         return result;
     }
 
-    // Map child texel index (0..15) to parent block quadrant.
-    inline void GetBC7ChildTexel(
-        const BC7QuadrantMeanBatch& p00,
-        const BC7QuadrantMeanBatch& p10,
-        const BC7QuadrantMeanBatch& p01,
-        const BC7QuadrantMeanBatch& p11,
-        size_t texelIndex,
-        XMVECTOR texelOut[4]) noexcept
-    {
-        const BC7QuadrantMeanBatch* parent;
-        size_t quadrant;
-
-        switch (texelIndex)
-        {
-        case 0:  parent = &p00; quadrant = 0; break;
-        case 1:  parent = &p00; quadrant = 1; break;
-        case 2:  parent = &p10; quadrant = 0; break;
-        case 3:  parent = &p10; quadrant = 1; break;
-        case 4:  parent = &p00; quadrant = 2; break;
-        case 5:  parent = &p00; quadrant = 3; break;
-        case 6:  parent = &p10; quadrant = 2; break;
-        case 7:  parent = &p10; quadrant = 3; break;
-        case 8:  parent = &p01; quadrant = 0; break;
-        case 9:  parent = &p01; quadrant = 1; break;
-        case 10: parent = &p11; quadrant = 0; break;
-        case 11: parent = &p11; quadrant = 1; break;
-        case 12: parent = &p01; quadrant = 2; break;
-        case 13: parent = &p01; quadrant = 3; break;
-        case 14: parent = &p11; quadrant = 2; break;
-        case 15: default: parent = &p11; quadrant = 3; break;
-        }
-
-        texelOut[0] = parent->value[quadrant][0];
-        texelOut[1] = parent->value[quadrant][1];
-        texelOut[2] = parent->value[quadrant][2];
-        texelOut[3] = parent->value[quadrant][3];
-    }
-
     // Assign 4-bit palette indices to sixteen child texels with anchor bit enforcement.
     inline BC7Mode6PackedIndexBatch AssignBC7Mode6Indices(
-        const BC7QuadrantMeanBatch& p00,
-        const BC7QuadrantMeanBatch& p10,
-        const BC7QuadrantMeanBatch& p01,
-        const BC7QuadrantMeanBatch& p11,
+        const BC7ChildCanvas& canvas,
         BC7EndpointPairBatch& endpoints,
-        FXMVECTOR activeMask) noexcept
+        FXMVECTOR activeMask,
+        XMVECTOR* outTotalError = nullptr) noexcept
     {
         constexpr float colorScale = 1.0f / 255.0f;
         constexpr uint32_t weights[16] = { 0, 4, 9, 13, 17, 21, 26, 30, 34, 38, 43, 47, 51, 55, 60, 64 };
@@ -2262,17 +4833,15 @@ namespace // for bc7
 
         // 2. Find nearest palette color for each of the 16 child texels.
         XMVECTOR texelIndices[16];
+        XMVECTOR totalError = XMVectorZero();
 
         for (size_t t = 0; t < 16; ++t)
         {
-            XMVECTOR texel[4];
-            GetBC7ChildTexel(p00, p10, p01, p11, t, texel);
-
             // Distance to palette color 0
             XMVECTOR bestDist = XMVectorZero();
             for (size_t c = 0; c < 4; ++c)
             {
-                const XMVECTOR diff = XMVectorSubtract(texel[c], paletteColors[0][c]);
+                const XMVECTOR diff = XMVectorSubtract(canvas.texels[t][c], paletteColors[0][c]);
                 bestDist = XMVectorMultiplyAdd(diff, diff, bestDist);
             }
             XMVECTOR bestIndex = XMVectorZero();
@@ -2283,7 +4852,7 @@ namespace // for bc7
                 XMVECTOR distK = XMVectorZero();
                 for (size_t c = 0; c < 4; ++c)
                 {
-                    const XMVECTOR diff = XMVectorSubtract(texel[c], paletteColors[k][c]);
+                    const XMVECTOR diff = XMVectorSubtract(canvas.texels[t][c], paletteColors[k][c]);
                     distK = XMVectorMultiplyAdd(diff, diff, distK);
                 }
 
@@ -2293,6 +4862,12 @@ namespace // for bc7
             }
 
             texelIndices[t] = bestIndex;
+            totalError = XMVectorAdd(totalError, bestDist);
+        }
+
+        if (outTotalError)
+        {
+            *outTotalError = XMVectorAndInt(totalError, activeMask);
         }
 
         // 3. Anchor constraint: texel 0 MSB must be 0 (index <= 7).
@@ -2409,6 +4984,91 @@ namespace // for bc7
         if (validLanes > 3) XMStoreInt4(&blocks[3].x, blockRows.r[3]);
     }
 
+    // Dedicated function to evaluate all candidate BC7 modes via Rate-Distortion MSE,
+    // pick the winning mode, and store the resulting 128-bit block into destination memory.
+    inline uint8_t FitAndStoreBC7ChildBlock(
+        XMUINT4* destinationBlock,
+        const BC7ChildCanvas& canvas,
+        uint32_t part2S,
+        uint32_t part3SM0,
+        uint32_t part3SM2,
+        const XMUINT4& mode6Block,
+        float errorMode6,
+        bool isOpaque,
+        size_t lane) noexcept
+    {
+        assert(destinationBlock != nullptr);
+
+        uint8_t selectedMode = 6;
+        float minError = errorMode6;
+        XMUINT4 winningBlock = mode6Block;
+
+        if (isOpaque)
+        {
+            // 5-way Rate-Distortion showdown for opaque blocks: Mode 0, Mode 1, Mode 2, Mode 3, Mode 6
+            const BC7Mode0FitResult m0 = FitBC7Mode0SingleLane(canvas, part3SM0, lane);
+            const BC7Mode1FitResult m1 = FitBC7Mode1SingleLane(canvas, part2S, lane);
+            const BC7Mode2FitResult m2 = FitBC7Mode2SingleLane(canvas, part3SM2, lane);
+            const BC7Mode3FitResult m3 = FitBC7Mode3SingleLane(canvas, part2S, lane);
+
+            if (m0.totalError < minError)
+            {
+                minError = m0.totalError;
+                selectedMode = 0;
+                winningBlock = m0.block;
+            }
+            if (m1.totalError < minError)
+            {
+                minError = m1.totalError;
+                selectedMode = 1;
+                winningBlock = m1.block;
+            }
+            if (m2.totalError < minError)
+            {
+                minError = m2.totalError;
+                selectedMode = 2;
+                winningBlock = m2.block;
+            }
+            if (m3.totalError < minError)
+            {
+                minError = m3.totalError;
+                selectedMode = 3;
+                winningBlock = m3.block;
+            }
+        }
+        else
+        {
+            // 4-way Rate-Distortion showdown for translucent blocks: Mode 4, Mode 5, Mode 6, Mode 7
+            const BC7Mode7FitResult m7 = FitBC7Mode7SingleLane(canvas, part2S, lane);
+            const BC7Mode4FitResult m4 = FitBC7Mode4SingleLane(canvas, lane);
+            const BC7Mode5FitResult m5 = FitBC7Mode5SingleLane(canvas, lane);
+
+            if (m7.totalError < minError)
+            {
+                minError = m7.totalError;
+                selectedMode = 7;
+                winningBlock = m7.block;
+            }
+            if (m4.totalError < minError)
+            {
+                minError = m4.totalError;
+                selectedMode = 4;
+                winningBlock = m4.block;
+            }
+            if (m5.totalError < minError)
+            {
+                minError = m5.totalError;
+                selectedMode = 5;
+                winningBlock = m5.block;
+            }
+        }
+
+        // Store the winning mode's 128-bit block directly into destination memory
+        *destinationBlock = winningBlock;
+
+        return selectedMode;
+    }
+
     // Process one mip-1 block row directly from compressed BC7 Mode 6 parent blocks.
     inline void ProcessCompressedRowBC7(
         const Image& source,
@@ -2460,40 +5120,124 @@ namespace // for bc7
             const BC7BlockBatch b01 = LoadBC7BlockBatch(p01Blocks);
             const BC7BlockBatch b11 = LoadBC7BlockBatch(p11Blocks);
 
-            // 2. Extract Mode 6 symbols & compute exact UNORM quadrant means
-            const BC7Mode6SymbolBatch s00 = ExtractBC7Mode6Symbols(b00);
-            const BC7Mode6SymbolBatch s10 = ExtractBC7Mode6Symbols(b10);
-            const BC7Mode6SymbolBatch s01 = ExtractBC7Mode6Symbols(b01);
-            const BC7Mode6SymbolBatch s11 = ExtractBC7Mode6Symbols(b11);
+            // 2. Compute exact UNORM quadrant means across parent modes (Mode 1, Mode 6)
+            const BC7QuadrantMeanBatch q00 = ComputeBC7ParentQuadrantMeans(b00, activeMask);
+            const BC7QuadrantMeanBatch q10 = ComputeBC7ParentQuadrantMeans(b10, activeMask);
+            const BC7QuadrantMeanBatch q01 = ComputeBC7ParentQuadrantMeans(b01, activeMask);
+            const BC7QuadrantMeanBatch q11 = ComputeBC7ParentQuadrantMeans(b11, activeMask);
 
-            const BC7QuadrantMeanBatch q00 = ComputeBC7Mode6QuadrantMeans(s00.endpoints, s00.indices, activeMask);
-            const BC7QuadrantMeanBatch q10 = ComputeBC7Mode6QuadrantMeans(s10.endpoints, s10.indices, activeMask);
-            const BC7QuadrantMeanBatch q01 = ComputeBC7Mode6QuadrantMeans(s01.endpoints, s01.indices, activeMask);
-            const BC7QuadrantMeanBatch q11 = ComputeBC7Mode6QuadrantMeans(s11.endpoints, s11.indices, activeMask);
-
-            // 3. Child block moments (ANOVA identity)
+            // 3. Build child canonical canvas (16 texels, moments, 4D axis, opacity)
             BC7SourceBlockMeansBatch sourceMeans{};
-            BC7BlockMeanBatch childMean{};
-            BC7CovarianceMatrixBatch childCovariance{};
-            ComputeBC7ChildBlockMoments(q00, q10, q01, q11, sourceMeans, childMean, childCovariance);
+            const BC7ChildCanvas canvas = BuildBC7ChildCanvas(q00, q10, q01, q11, sourceMeans);
 
-            // 4. Estimate PCA initial endpoints in 4D
-            const BC7EndpointPairFloatBatch floatEndpoints = ComputeInitialEndpointsBC7Mode6PCA(childCovariance, childMean, q00, q10, q01, q11);
-
-            // 5. Quantize endpoints to 7-bit with majority-voted P-bits
+            // 4. Fit Mode 6 endpoints and 4-bit indices
+            const BC7EndpointPairFloatBatch floatEndpoints = ComputeInitialEndpointsBC7Mode6PCA(canvas);
             BC7EndpointPairBatch quantizedEndpoints = QuantizeBC7Mode6Endpoints(floatEndpoints);
+            XMVECTOR errorMode6 = XMVectorZero();
+            const BC7Mode6PackedIndexBatch childIndices = AssignBC7Mode6Indices(canvas, quantizedEndpoints, activeMask, &errorMode6);
+            const BC7BlockBatch mode6Encoded = EmitBC7Mode6BlockBatch(quantizedEndpoints, childIndices);
 
-            // 6. Assign 4-bit indices to the 16 child texels with anchor bit enforcement
-            const BC7Mode6PackedIndexBatch childIndices = AssignBC7Mode6Indices(q00, q10, q01, q11, quantizedEndpoints, activeMask);
+            alignas(16) XMUINT4 mode6Blocks[4]{};
+            StoreBC7BlockBatch(mode6Blocks, mode6Encoded, validLanes);
 
-            // 7. Emit 128-bit Mode 6 blocks and store
-            const BC7BlockBatch encoded = EmitBC7Mode6BlockBatch(quantizedEndpoints, childIndices);
-            StoreBC7BlockBatch(destinationBlocks + destinationX, encoded, validLanes);
+            // 5. FasTC-style 2-subset and 3-subset partition estimation (arg-min Hamming distance, 0 thresholds)
+            const XMVECTOR part2S = EstimateBC7Partition2Subsets(canvas);
+            alignas(16) uint32_t part2SLanes[4]{};
+            _mm_store_si128(reinterpret_cast<__m128i*>(part2SLanes), _mm_castps_si128(part2S));
+
+            const BC7Partition3SubsetsResult part3S = EstimateBC7Partition3Subsets(canvas);
+            alignas(16) uint32_t part3SMode0Lanes[4]{};
+            alignas(16) uint32_t part3SMode2Lanes[4]{};
+            _mm_store_si128(reinterpret_cast<__m128i*>(part3SMode0Lanes), _mm_castps_si128(part3S.mode0Shape));
+            _mm_store_si128(reinterpret_cast<__m128i*>(part3SMode2Lanes), _mm_castps_si128(part3S.mode2Shape));
+
+            alignas(16) uint32_t opaqueLanes[4]{};
+            _mm_store_si128(reinterpret_cast<__m128i*>(opaqueLanes), _mm_castps_si128(canvas.isOpaque));
+
+            // 6. Pure Rate-Distortion MSE comparison: min(E_0, E_1, E_2, E_3, E_6) without arbitrary thresholds
+            // 6. Rate-Distortion mode evaluation and child block storage for all lanes
+            for (size_t lane = 0; lane < validLanes; ++lane)
+            {
+                const bool isOpaque = (opaqueLanes[lane] != 0);
+                const float e6 = XMVectorGetByIndex(errorMode6, lane);
+
+                if (isOpaque)
+                {
+                    const BC7Mode0FitResult m0 = FitBC7Mode0SingleLane(canvas, part3SMode0Lanes[lane], lane);
+                    const BC7Mode1FitResult m1 = FitBC7Mode1SingleLane(canvas, part2SLanes[lane], lane);
+                    const BC7Mode2FitResult m2 = FitBC7Mode2SingleLane(canvas, part3SMode2Lanes[lane], lane);
+                    const BC7Mode3FitResult m3 = FitBC7Mode3SingleLane(canvas, part2SLanes[lane], lane);
+
+                    float minError = e6;
+                    XMUINT4 bestBlock = mode6Blocks[lane];
+
+                    if (m0.totalError < minError)
+                    {
+                        minError = m0.totalError;
+                        bestBlock = m0.block;
+                    }
+                    if (m1.totalError < minError)
+                    {
+                        minError = m1.totalError;
+                        bestBlock = m1.block;
+                    }
+                    if (m2.totalError < minError)
+                    {
+                        minError = m2.totalError;
+                        bestBlock = m2.block;
+                    }
+                    if (m3.totalError < minError)
+                    {
+                        minError = m3.totalError;
+                        bestBlock = m3.block;
+                    }
+
+                    destinationBlocks[destinationX + lane] = bestBlock;
+                    continue;
+                }
+
+                // Block has varying alpha: 4-way Rate-Distortion MSE comparison min(E_4, E_5, E_6, E_7)
+                const BC7Mode7FitResult m7 = FitBC7Mode7SingleLane(canvas, part2SLanes[lane], lane);
+                const BC7Mode4FitResult m4 = FitBC7Mode4SingleLane(canvas, lane);
+                const BC7Mode5FitResult m5 = FitBC7Mode5SingleLane(canvas, lane);
+
+                float minAlphaError = e6;
+                XMUINT4 bestAlphaBlock = mode6Blocks[lane];
+
+                if (m7.totalError < minAlphaError)
+                {
+                    minAlphaError = m7.totalError;
+                    bestAlphaBlock = m7.block;
+                }
+                if (m4.totalError < minAlphaError)
+                {
+                    minAlphaError = m4.totalError;
+                    bestAlphaBlock = m4.block;
+                }
+                if (m5.totalError < minAlphaError)
+                {
+                    minAlphaError = m5.totalError;
+                    bestAlphaBlock = m5.block;
+                }
+
+                destinationBlocks[destinationX + lane] = bestAlphaBlock;
+                FitAndStoreBC7ChildBlock(
+                    &destinationBlocks[destinationX + lane],
+                    canvas,
+                    part2SLanes[lane],
+                    part3SMode0Lanes[lane],
+                    part3SMode2Lanes[lane],
+                    mode6Blocks[lane],
+                    e6,
+                    isOpaque,
+                    lane
+                );
+            }
         }
     }
 
-    // Verify that all blocks in the image use BC7 Mode 6.
-    inline bool IsMode6BC7Image(const Image& image) noexcept
+    // Verify that all blocks in the image use supported BC7 modes (Mode 0 through 7).
+    inline bool IsSupportedBC7Image(const Image& image) noexcept
     {
         const size_t blockWidth = std::max<size_t>(1, (image.width + 3) / 4);
         const size_t blockHeight = std::max<size_t>(1, (image.height + 3) / 4);
@@ -2503,7 +5247,8 @@ namespace // for bc7
             const auto* row = reinterpret_cast<const uint8_t*>(image.pixels + y * image.rowPitch);
             for (size_t x = 0; x < blockWidth; ++x)
             {
-                if (GetBC7Mode(row + x * 16) != 6)
+                const uint8_t mode = GetBC7Mode(row + x * 16);
+                if (mode >= 8)
                 {
                     return false;
                 }
@@ -2570,8 +5315,8 @@ HRESULT DirectX::GenerateCompressedMipMaps(const Image& baseImage, size_t levels
 
     case DXGI_FORMAT_BC7_UNORM:
     case DXGI_FORMAT_BC7_UNORM_SRGB:
-        // For BC7, verify that all blocks use Mode 6.
-        if (!IsMode6BC7Image(baseImage))
+        // Verify that all blocks use supported modes (Mode 1, Mode 6, Mode 7).
+        if (!IsSupportedBC7Image(baseImage))
         {
             return HRESULT_E_NOT_SUPPORTED;
         }
