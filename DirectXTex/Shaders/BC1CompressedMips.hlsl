@@ -267,6 +267,7 @@ uint2 EncodeSamples(float3 samples[16])
     // Quantize the optimized endpoint pair into the actual stored BC1 representation.
     uint packed0 = PackRGB565(endpoint0);
     uint packed1 = PackRGB565(endpoint1);
+
     // Separate equal endpoints so the block cannot accidentally enter three-color mode.
     if (packed0 == packed1)
     {
@@ -275,6 +276,7 @@ uint2 EncodeSamples(float3 samples[16])
         else
             ++packed0;
     }
+
     // Opaque BC1 requires endpoint 0 to be numerically greater than endpoint 1.
     if (packed1 > packed0)
     {
@@ -286,6 +288,7 @@ uint2 EncodeSamples(float3 samples[16])
     // Rebuild the palette after quantization before assigning final selectors.
     float3 palette[4];
     BuildPalette(uint2(packed0 | (packed1 << 16), 0u), palette);
+    
     uint selectors = 0u;
     [unroll]
     for (uint t = 0u; t < 16u; ++t)

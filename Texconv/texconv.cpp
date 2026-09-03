@@ -3786,6 +3786,7 @@ int __cdecl wmain(_In_ int argc, _In_z_count_(argc) wchar_t* argv[])
                         continue;
                     }
 
+                    // OUR MAIN START POINT 
                     // Lee: generate mipmap in compression domain 
                     if (useCompressionDomainMips)
                     {
