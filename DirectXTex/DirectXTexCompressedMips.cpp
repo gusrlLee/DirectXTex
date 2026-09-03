@@ -1735,8 +1735,139 @@ namespace // for bc4
         return packed;
     }
 
+    // Sum of squared errors between the block and the six-interpolated palette it decodes to.
+    inline float EvaluateBC4SixInterpError(const BC4TexelBlock& texels, uint32_t red0, uint32_t red1) noexcept
+    {
+        // Equal endpoints degenerate into the four-interpolated mode, which is scored separately.
+        if (red0 <= red1)
+        {
+            return FLT_MAX;
+        }
+
+        float palette[8];
+        constexpr float scale = 1.0f / 255.0f;
+        const float fred0 = static_cast<float>(red0) * scale;
+        const float fred1 = static_cast<float>(red1) * scale;
+
+        palette[0] = fred0;
+        palette[1] = fred1;
+        for (size_t index = 2; index < 8; ++index)
+        {
+            const float weight = static_cast<float>(g_bc4SixInterpWeights[index]);
+            palette[index] = (fred0 * (7.0f - weight) + fred1 * weight) * (1.0f / 7.0f);
+        }
+
+        // The index assignment is a closed form, so scoring only needs the chosen ramp position.
+        const float inverseSpan = 1.0f / static_cast<float>(red0 - red1);
+        const XMVECTOR multiplier = XMVectorReplicate(255.0f * 7.0f * inverseSpan);
+        const XMVECTOR offset = XMVectorReplicate(-7.0f * static_cast<float>(red1) * inverseSpan);
+        const XMVECTOR lowerBound = XMVectorZero();
+        const XMVECTOR upperBound = XMVectorReplicate(7.0f);
+
+        float total = 0.0f;
+
+        for (size_t row = 0; row < 4; ++row)
+        {
+            XMVECTOR position = XMVectorMultiplyAdd(texels.rows[row], multiplier, offset);
+            position = XMVectorClamp(position, lowerBound, upperBound);
+
+            alignas(16) int32_t positions[4];
+            _mm_store_si128(reinterpret_cast<__m128i*>(positions), _mm_cvtps_epi32(position));
+
+            for (size_t lane = 0; lane < 4; ++lane)
+            {
+                const uint32_t index = g_bc4RampToIndex[static_cast<size_t>(positions[lane]) & 0x07u];
+                const float difference = XMVectorGetByIndex(texels.rows[row], lane) - palette[index];
+                total += difference * difference;
+            }
+        }
+
+        return total;
+    }
+
+    // Assign the closest palette index to every texel of a four-interpolated block.
+    // Palette entries six and seven are the absolute values 0.0 and 1.0, so no closed form exists.
+    inline uint64_t AssignBC4FourInterpIndices(const BC4TexelBlock& texels, uint32_t red0, uint32_t red1, float& outError) noexcept
+    {
+        float palette[8];
+        BuildBC4FourInterpPalette(red0, red1, palette);
+
+        uint64_t packed = 0;
+        outError = 0.0f;
+
+        for (size_t texel = 0; texel < 16; ++texel)
+        {
+            const float value = XMVectorGetByIndex(texels.rows[texel >> 2], texel & 3);
+
+            float bestDistance = FLT_MAX;
+            uint32_t bestIndex = 0;
+
+            for (uint32_t index = 0; index < 8; ++index)
+            {
+                const float difference = value - palette[index];
+                const float distance = difference * difference;
+                if (distance < bestDistance)
+                {
+                    bestDistance = distance;
+                    bestIndex = index;
+                }
+            }
+
+            packed |= static_cast<uint64_t>(bestIndex) << (3 * texel);
+            outError += bestDistance;
+        }
+
+        return packed;
+    }
+
+    // Fit the four-interpolated mode, whose palette holds the absolute values 0.0 and 1.0.
+    // Blocks that saturate at either extreme spend no ramp entry reproducing it.
+    inline uint64_t EncodeBC4FourInterpBlock(const BC4TexelBlock& texels, float& outError) noexcept
+    {
+        // The absolute entries cover the extremes, so the ramp only has to span the interior.
+        const XMVECTOR minimum = XMVectorMin(XMVectorMin(texels.rows[0], texels.rows[1]), XMVectorMin(texels.rows[2], texels.rows[3]));
+        const XMVECTOR maximum = XMVectorMax(XMVectorMax(texels.rows[0], texels.rows[1]), XMVectorMax(texels.rows[2], texels.rows[3]));
+
+        const float blockMinimum = std::min(std::max(HorizontalMinBC4(minimum), 0.0f), 1.0f);
+        const float blockMaximum = std::min(std::max(HorizontalMaxBC4(maximum), 0.0f), 1.0f);
+
+        // Interior extremes ignore texels that the absolute palette entries already reproduce.
+        constexpr float saturationEpsilon = 1.0f / 512.0f;
+        float interiorMinimum = 1.0f;
+        float interiorMaximum = 0.0f;
+        bool hasInterior = false;
+
+        for (size_t texel = 0; texel < 16; ++texel)
+        {
+            const float value = XMVectorGetByIndex(texels.rows[texel >> 2], texel & 3);
+            if (value > saturationEpsilon && value < 1.0f - saturationEpsilon)
+            {
+                hasInterior = true;
+                interiorMinimum = std::min(interiorMinimum, value);
+                interiorMaximum = std::max(interiorMaximum, value);
+            }
+        }
+
+        if (!hasInterior)
+        {
+            interiorMinimum = blockMinimum;
+            interiorMaximum = blockMaximum;
+        }
+
+        // The four-interpolated mode requires red0 <= red1, so the smaller code comes first.
+        uint32_t red0 = QuantizeBC4Endpoint(interiorMinimum);
+        uint32_t red1 = QuantizeBC4Endpoint(interiorMaximum);
+        if (red0 > red1)
+        {
+            std::swap(red0, red1);
+        }
+
+        const uint64_t indices = AssignBC4FourInterpIndices(texels, red0, red1, outError);
+        return static_cast<uint64_t>(red0) | (static_cast<uint64_t>(red1) << 8) | (indices << 16);
+    }
+
     // Encode sixteen texel values into one BC4 block using the six-interpolated mode.
-    inline uint64_t EncodeBC4Block(const BC4TexelBlock& texels) noexcept
+    inline uint64_t EncodeBC4SixInterpBlock(const BC4TexelBlock& texels, float& outError) noexcept
     {
         // Two passes suffice because the min and max seed already lies close to the optimum.
         constexpr size_t refinementPasses = 2;
@@ -1782,8 +1913,33 @@ namespace // for bc4
         }
 
         // Equal endpoints decode through the four-interpolated mode, where index zero is exact.
+        outError = (red0 > red1) ? EvaluateBC4SixInterpError(texels, red0, red1) : 0.0f;
+
+        if (red0 == red1)
+        {
+            // A constant block reproduces its single value exactly through palette entry zero.
+            const float constantValue = static_cast<float>(red0) * (1.0f / 255.0f);
+            for (size_t texel = 0; texel < 16; ++texel)
+            {
+                const float difference = XMVectorGetByIndex(texels.rows[texel >> 2], texel & 3) - constantValue;
+                outError += difference * difference;
+            }
+        }
+
         const uint64_t indices = AssignBC4Indices(texels, red0, red1);
         return static_cast<uint64_t>(red0) | (static_cast<uint64_t>(red1) << 8) | (indices << 16);
+    }
+
+    // Encode one BC4 block, choosing whichever interpolation mode reproduces it more closely.
+    inline uint64_t EncodeBC4Block(const BC4TexelBlock& texels) noexcept
+    {
+        float sixInterpError = FLT_MAX;
+        const uint64_t sixInterp = EncodeBC4SixInterpBlock(texels, sixInterpError);
+
+        float fourInterpError = FLT_MAX;
+        const uint64_t fourInterp = EncodeBC4FourInterpBlock(texels, fourInterpError);
+
+        return (fourInterpError < sixInterpError) ? fourInterp : sixInterp;
     }
 
     // Place one recovered quadrant mean into the child texel grid.
@@ -3062,13 +3218,59 @@ namespace // for bc7
     }
 
 
-    // Compute the exact UNORM quadrant means using the BC7 hardware rounding rules.
+    // A BC7_UNORM_SRGB texture stores sRGB-encoded color and linear alpha, so a box filter is
+    // only a box filter once the color channels are linearized. Averaging the raw code values
+    // instead darkens every generated level, which is why every mean below runs in linear light.
+    template<bool IsSrgb>
+    inline XMVECTOR BC7CodeToLinear(FXMVECTOR code8, size_t channel) noexcept
+    {
+        // Alpha carries coverage rather than color, so the transfer curve never applies to it.
+        if (IsSrgb && channel < 3)
+        {
+            const auto& table = GetSrgb8ToLinearTable();
+
+            return XMVectorSet(
+                table[static_cast<size_t>(XMVectorGetIntX(code8)) & 0xFFu],
+                table[static_cast<size_t>(XMVectorGetIntY(code8)) & 0xFFu],
+                table[static_cast<size_t>(XMVectorGetIntZ(code8)) & 0xFFu],
+                table[static_cast<size_t>(XMVectorGetIntW(code8)) & 0xFFu]);
+        }
+
+        return XMVectorScale(XMConvertVectorUIntToFloat(code8, 0), 1.0f / 255.0f);
+    }
+
+    // Apply the sRGB transfer curve independently to all four SIMD lanes.
+    inline XMVECTOR BC7LinearToSrgbBatch(FXMVECTOR linear) noexcept
+    {
+        // Clamp first because the sRGB transfer function is defined only for display-range values.
+        const XMVECTOR value = XMVectorClamp(linear, XMVectorZero(), XMVectorReplicate(1.0f));
+        const XMVECTOR low = XMVectorScale(value, 12.92f);
+        XMVECTOR high = XMVectorPow(value, XMVectorReplicate(1.0f / 2.4f));
+        high = XMVectorSubtract(XMVectorScale(high, 1.055f), XMVectorReplicate(0.055f));
+        const XMVECTOR highMask = XMVectorGreater(value, XMVectorReplicate(0.0031308f));
+        return XMVectorSelect(low, high, highMask);
+    }
+
+    // Return a linear value to the code space that BC7 endpoints are quantized in.
+    template<bool IsSrgb>
+    inline XMVECTOR BC7LinearToCode(FXMVECTOR linear, size_t channel) noexcept
+    {
+        if (IsSrgb && channel < 3)
+        {
+            return BC7LinearToSrgbBatch(linear);
+        }
+
+        return linear;
+    }
+
+    // Compute the exact quadrant means in linear light using the BC7 hardware rounding rules.
+    template<bool IsSrgb>
     inline BC7QuadrantMeanBatch ComputeBC7Mode6QuadrantMeans(
         const BC7EndpointPairBatch& endpoints,
         const BC7Mode6PackedIndexBatch& indices,
         FXMVECTOR activeMask) noexcept
     {
-        constexpr float colorScale = 1.0f / (255.0f * 4.0f);
+        constexpr float colorScale = 1.0f / 4.0f;
         constexpr uint32_t weights[16] = { 0, 4, 9, 13, 17, 21, 26, 30, 34, 38, 43, 47, 51, 55, 60, 64 };
 
         BC7QuadrantMeanBatch result{};
@@ -3089,7 +3291,7 @@ namespace // for bc7
             for (size_t c = 0; c < 4; ++c)
             {
                 const XMVECTOR rounded = InterpolateBC7PaletteValue(endpoints.value[0][c], endpoints.value[1][c], weights[i]);
-                colorFloat[c] = XMConvertVectorUIntToFloat(rounded, 0);
+                colorFloat[c] = BC7CodeToLinear<IsSrgb>(rounded, c);
             }
 
             for (size_t q = 0; q < 4; ++q)
@@ -3114,8 +3316,8 @@ namespace // for bc7
     }
 
 
-    // Compute exact UNORM quadrant means for partitioned multi-subset BC7 modes (Mode 0, 1, 2, 3, 7).
-    template<size_t IndexBits>
+    // Compute exact linear quadrant means for partitioned multi-subset BC7 modes (Mode 0, 1, 2, 3, 7).
+    template<size_t IndexBits, bool IsSrgb>
     inline BC7QuadrantMeanBatch ComputeBC7MultiSubsetQuadrantMeans(
         const BC7MultiSubsetEndpointBatch& endpoints,
         FXMVECTOR partition,
@@ -3126,7 +3328,7 @@ namespace // for bc7
         static_assert(IndexBits == 2 || IndexBits == 3, "Invalid BC7 index precision");
         assert(mode == 0 || mode == 1 || mode == 2 || mode == 3 || mode == 7);
 
-        constexpr float colorScale = 1.0f / (255.0f * 4.0f);
+        constexpr float colorScale = 1.0f / 4.0f;
 
         alignas(16) uint32_t shapes[4];
         _mm_store_si128(reinterpret_cast<__m128i*>(shapes), _mm_castps_si128(partition));
@@ -3168,7 +3370,7 @@ namespace // for bc7
                 ep1 = XMVectorSelect(ep1, endpoints.value[2][1][c], isS2);
 
                 const XMVECTOR colorUInt = InterpolateBC7PaletteVector(ep0, ep1, weightFloat);
-                texelColorsFloat[t][c] = XMConvertVectorUIntToFloat(colorUInt, 0);
+                texelColorsFloat[t][c] = BC7CodeToLinear<IsSrgb>(colorUInt, c);
             }
         }
 
@@ -3202,65 +3404,58 @@ namespace // for bc7
         return result;
     }
 
-    // Backwards-compatible alias for two-subset callers
-    template<size_t IndexBits>
-    inline BC7QuadrantMeanBatch ComputeBC7TwoSubsetQuadrantMeans(
-        const BC7MultiSubsetEndpointBatch& endpoints,
-        FXMVECTOR partition,
-        const BC7IndexBatch& indices,
-        uint8_t mode,
-        FXMVECTOR activeMask) noexcept
-    {
-        return ComputeBC7MultiSubsetQuadrantMeans<IndexBits>(endpoints, partition, indices, mode, activeMask);
-    }
-
+    template<bool IsSrgb>
     inline BC7QuadrantMeanBatch ComputeBC7Mode0QuadrantMeans(
         const BC7MultiSubsetEndpointBatch& endpoints,
         FXMVECTOR partition,
         const BC7IndexBatch& indices,
         FXMVECTOR activeMask) noexcept
     {
-        return ComputeBC7MultiSubsetQuadrantMeans<3>(endpoints, partition, indices, 0, activeMask);
+        return ComputeBC7MultiSubsetQuadrantMeans<3, IsSrgb>(endpoints, partition, indices, 0, activeMask);
     }
 
+    template<bool IsSrgb>
     inline BC7QuadrantMeanBatch ComputeBC7Mode1QuadrantMeans(
         const BC7MultiSubsetEndpointBatch& endpoints,
         FXMVECTOR partition,
         const BC7IndexBatch& indices,
         FXMVECTOR activeMask) noexcept
     {
-        return ComputeBC7MultiSubsetQuadrantMeans<3>(endpoints, partition, indices, 1, activeMask);
+        return ComputeBC7MultiSubsetQuadrantMeans<3, IsSrgb>(endpoints, partition, indices, 1, activeMask);
     }
 
+    template<bool IsSrgb>
     inline BC7QuadrantMeanBatch ComputeBC7Mode2QuadrantMeans(
         const BC7MultiSubsetEndpointBatch& endpoints,
         FXMVECTOR partition,
         const BC7IndexBatch& indices,
         FXMVECTOR activeMask) noexcept
     {
-        return ComputeBC7MultiSubsetQuadrantMeans<2>(endpoints, partition, indices, 2, activeMask);
+        return ComputeBC7MultiSubsetQuadrantMeans<2, IsSrgb>(endpoints, partition, indices, 2, activeMask);
     }
 
+    template<bool IsSrgb>
     inline BC7QuadrantMeanBatch ComputeBC7Mode3QuadrantMeans(
         const BC7MultiSubsetEndpointBatch& endpoints,
         FXMVECTOR partition,
         const BC7IndexBatch& indices,
         FXMVECTOR activeMask) noexcept
     {
-        return ComputeBC7MultiSubsetQuadrantMeans<2>(endpoints, partition, indices, 3, activeMask);
+        return ComputeBC7MultiSubsetQuadrantMeans<2, IsSrgb>(endpoints, partition, indices, 3, activeMask);
     }
 
+    template<bool IsSrgb>
     inline BC7QuadrantMeanBatch ComputeBC7Mode7QuadrantMeans(
         const BC7MultiSubsetEndpointBatch& endpoints,
         FXMVECTOR partition,
         const BC7IndexBatch& indices,
         FXMVECTOR activeMask) noexcept
     {
-        return ComputeBC7MultiSubsetQuadrantMeans<2>(endpoints, partition, indices, 7, activeMask);
+        return ComputeBC7MultiSubsetQuadrantMeans<2, IsSrgb>(endpoints, partition, indices, 7, activeMask);
     }
 
-    // Dispatch and compute exact quadrant means across mixed parent block modes (Mode 0, 1, 2, 3, 6, 7).
-    // Compute exact UNORM quadrant means for 1-subset dual-index BC7 modes with rotation (Mode 4 and Mode 5).
+    // Compute exact linear quadrant means for 1-subset dual-index BC7 modes with rotation (Mode 4 and Mode 5).
+    template<bool IsSrgb>
     inline BC7QuadrantMeanBatch ComputeBC7DualIndexQuadrantMeans(
         const BC7EndpointPairBatch& endpoints,
         const BC7IndexBatch& idx1,
@@ -3270,7 +3465,7 @@ namespace // for bc7
         bool isMode4,
         FXMVECTOR activeMask) noexcept
     {
-        constexpr float colorScale = 1.0f / (255.0f * 4.0f);
+        constexpr float colorScale = 1.0f / 4.0f;
 
         const XMVECTOR isRot1 = _mm_castsi128_ps(_mm_cmpeq_epi32(_mm_castps_si128(rotation), _mm_set1_epi32(1)));
         const XMVECTOR isRot2 = _mm_castsi128_ps(_mm_cmpeq_epi32(_mm_castps_si128(rotation), _mm_set1_epi32(2)));
@@ -3303,26 +3498,23 @@ namespace // for bc7
             const XMVECTOR bInt = InterpolateBC7PaletteVector(endpoints.value[0][2], endpoints.value[1][2], wcFloat);
             const XMVECTOR aInt = InterpolateBC7PaletteVector(endpoints.value[0][3], endpoints.value[1][3], waFloat);
 
-            const XMVECTOR r = XMConvertVectorUIntToFloat(rInt, 0);
-            const XMVECTOR g = XMConvertVectorUIntToFloat(gInt, 0);
-            const XMVECTOR b = XMConvertVectorUIntToFloat(bInt, 0);
-            const XMVECTOR a = XMConvertVectorUIntToFloat(aInt, 0);
-
             // Channel rotation (swap with Alpha):
             // rot=1: swap(R, A)
             // rot=2: swap(G, A)
             // rot=3: swap(B, A)
-            const XMVECTOR outR = XMVectorSelect(r, a, isRot1);
-            const XMVECTOR outG = XMVectorSelect(g, a, isRot2);
-            const XMVECTOR outB = XMVectorSelect(b, a, isRot3);
-            XMVECTOR outA = XMVectorSelect(a, r, isRot1);
-            outA = XMVectorSelect(outA, g, isRot2);
-            outA = XMVectorSelect(outA, b, isRot3);
+            // Rotation decides which channel a code value finally lands in, so it has to happen
+            // before linearization: the sRGB curve applies to the destination channel, not the source.
+            const XMVECTOR outR = XMVectorSelect(rInt, aInt, isRot1);
+            const XMVECTOR outG = XMVectorSelect(gInt, aInt, isRot2);
+            const XMVECTOR outB = XMVectorSelect(bInt, aInt, isRot3);
+            XMVECTOR outA = XMVectorSelect(aInt, rInt, isRot1);
+            outA = XMVectorSelect(outA, gInt, isRot2);
+            outA = XMVectorSelect(outA, bInt, isRot3);
 
-            texelColorsFloat[t][0] = outR;
-            texelColorsFloat[t][1] = outG;
-            texelColorsFloat[t][2] = outB;
-            texelColorsFloat[t][3] = outA;
+            texelColorsFloat[t][0] = BC7CodeToLinear<IsSrgb>(outR, 0);
+            texelColorsFloat[t][1] = BC7CodeToLinear<IsSrgb>(outG, 1);
+            texelColorsFloat[t][2] = BC7CodeToLinear<IsSrgb>(outB, 2);
+            texelColorsFloat[t][3] = BC7CodeToLinear<IsSrgb>(outA, 3);
         }
 
         constexpr size_t quadrantTexels[4][4] =
@@ -3353,6 +3545,7 @@ namespace // for bc7
         return result;
     }
 
+    template<bool IsSrgb>
     inline BC7QuadrantMeanBatch ComputeBC7Mode4QuadrantMeans(
         const BC7EndpointPairBatch& endpoints,
         const BC7IndexBatch& idx1,
@@ -3361,9 +3554,10 @@ namespace // for bc7
         FXMVECTOR indexMode,
         FXMVECTOR activeMask) noexcept
     {
-        return ComputeBC7DualIndexQuadrantMeans(endpoints, idx1, idx2, rotation, indexMode, true, activeMask);
+        return ComputeBC7DualIndexQuadrantMeans<IsSrgb>(endpoints, idx1, idx2, rotation, indexMode, true, activeMask);
     }
 
+    template<bool IsSrgb>
     inline BC7QuadrantMeanBatch ComputeBC7Mode5QuadrantMeans(
         const BC7EndpointPairBatch& endpoints,
         const BC7IndexBatch& idx1,
@@ -3371,10 +3565,11 @@ namespace // for bc7
         FXMVECTOR rotation,
         FXMVECTOR activeMask) noexcept
     {
-        return ComputeBC7DualIndexQuadrantMeans(endpoints, idx1, idx2, rotation, XMVectorZero(), false, activeMask);
+        return ComputeBC7DualIndexQuadrantMeans<IsSrgb>(endpoints, idx1, idx2, rotation, XMVectorZero(), false, activeMask);
     }
 
-    // Dispatch and compute exact quadrant means across mixed parent block modes (Mode 0 through 7).
+    // Dispatch and compute exact linear quadrant means across mixed parent block modes (Mode 0 through 7).
+    template<bool IsSrgb>
     inline BC7QuadrantMeanBatch ComputeBC7ParentQuadrantMeans(const BC7BlockBatch& blocks, FXMVECTOR activeMask) noexcept
     {
         const BC7ModeMaskBatch modeMasks = GetBC7ModeMasks(blocks);
@@ -3395,7 +3590,7 @@ namespace // for bc7
             const XMVECTOR part0 = ExtractBC7Partition(blocks, 0, mask0);
             const BC7MultiSubsetEndpointBatch ep0 = ExtractBC7Mode0Endpoints(blocks, mask0);
             const BC7IndexBatch idx0 = ExtractBC7Mode0Indices(blocks, part0, mask0);
-            const BC7QuadrantMeanBatch q0 = ComputeBC7Mode0QuadrantMeans(ep0, part0, idx0, mask0);
+            const BC7QuadrantMeanBatch q0 = ComputeBC7Mode0QuadrantMeans<IsSrgb>(ep0, part0, idx0, mask0);
             for (size_t q = 0; q < 4; ++q)
             {
                 for (size_t c = 0; c < 4; ++c)
@@ -3412,7 +3607,7 @@ namespace // for bc7
             const XMVECTOR part1 = ExtractBC7Partition(blocks, 1, mask1);
             const BC7MultiSubsetEndpointBatch ep1 = ExtractBC7Mode1Endpoints(blocks, mask1);
             const BC7IndexBatch idx1 = ExtractBC7Mode1Indices(blocks, part1, mask1);
-            const BC7QuadrantMeanBatch q1 = ComputeBC7Mode1QuadrantMeans(ep1, part1, idx1, mask1);
+            const BC7QuadrantMeanBatch q1 = ComputeBC7Mode1QuadrantMeans<IsSrgb>(ep1, part1, idx1, mask1);
             for (size_t q = 0; q < 4; ++q)
             {
                 for (size_t c = 0; c < 4; ++c)
@@ -3429,7 +3624,7 @@ namespace // for bc7
             const XMVECTOR part2 = ExtractBC7Partition(blocks, 2, mask2);
             const BC7MultiSubsetEndpointBatch ep2 = ExtractBC7Mode2Endpoints(blocks, mask2);
             const BC7IndexBatch idx2 = ExtractBC7Mode2Indices(blocks, part2, mask2);
-            const BC7QuadrantMeanBatch q2 = ComputeBC7Mode2QuadrantMeans(ep2, part2, idx2, mask2);
+            const BC7QuadrantMeanBatch q2 = ComputeBC7Mode2QuadrantMeans<IsSrgb>(ep2, part2, idx2, mask2);
             for (size_t q = 0; q < 4; ++q)
             {
                 for (size_t c = 0; c < 4; ++c)
@@ -3446,7 +3641,7 @@ namespace // for bc7
             const XMVECTOR part3 = ExtractBC7Partition(blocks, 3, mask3);
             const BC7MultiSubsetEndpointBatch ep3 = ExtractBC7Mode3Endpoints(blocks, mask3);
             const BC7IndexBatch idx3 = ExtractBC7Mode3Indices(blocks, part3, mask3);
-            const BC7QuadrantMeanBatch q3 = ComputeBC7Mode3QuadrantMeans(ep3, part3, idx3, mask3);
+            const BC7QuadrantMeanBatch q3 = ComputeBC7Mode3QuadrantMeans<IsSrgb>(ep3, part3, idx3, mask3);
             for (size_t q = 0; q < 4; ++q)
             {
                 for (size_t c = 0; c < 4; ++c)
@@ -3465,7 +3660,7 @@ namespace // for bc7
             const BC7EndpointPairBatch ep4 = ExtractBC7Mode4Endpoints(blocks, mask4);
             const BC7IndexBatch idx1 = ExtractBC7PartitionedIndices(blocks, XMVectorZero(), 4, 50, 2, mask4);
             const BC7IndexBatch idx2 = ExtractBC7PartitionedIndices(blocks, XMVectorZero(), 4, 81, 3, mask4);
-            const BC7QuadrantMeanBatch q4 = ComputeBC7Mode4QuadrantMeans(ep4, idx1, idx2, rot4, idxMode4, mask4);
+            const BC7QuadrantMeanBatch q4 = ComputeBC7Mode4QuadrantMeans<IsSrgb>(ep4, idx1, idx2, rot4, idxMode4, mask4);
             for (size_t q = 0; q < 4; ++q)
             {
                 for (size_t c = 0; c < 4; ++c)
@@ -3483,7 +3678,7 @@ namespace // for bc7
             const BC7EndpointPairBatch ep5 = ExtractBC7Mode5Endpoints(blocks, mask5);
             const BC7IndexBatch idx1 = ExtractBC7PartitionedIndices(blocks, XMVectorZero(), 5, 66, 2, mask5);
             const BC7IndexBatch idx2 = ExtractBC7PartitionedIndices(blocks, XMVectorZero(), 5, 97, 2, mask5);
-            const BC7QuadrantMeanBatch q5 = ComputeBC7Mode5QuadrantMeans(ep5, idx1, idx2, rot5, mask5);
+            const BC7QuadrantMeanBatch q5 = ComputeBC7Mode5QuadrantMeans<IsSrgb>(ep5, idx1, idx2, rot5, mask5);
             for (size_t q = 0; q < 4; ++q)
             {
                 for (size_t c = 0; c < 4; ++c)
@@ -3499,7 +3694,7 @@ namespace // for bc7
         {
             const BC7EndpointPairBatch ep6 = ExtractBC7Mode6Endpoints(blocks, mask6);
             const BC7Mode6PackedIndexBatch idx6 = ExtractBC7Mode6PackedIndices(blocks, mask6);
-            const BC7QuadrantMeanBatch q6 = ComputeBC7Mode6QuadrantMeans(ep6, idx6, mask6);
+            const BC7QuadrantMeanBatch q6 = ComputeBC7Mode6QuadrantMeans<IsSrgb>(ep6, idx6, mask6);
             for (size_t q = 0; q < 4; ++q)
             {
                 for (size_t c = 0; c < 4; ++c)
@@ -3516,7 +3711,7 @@ namespace // for bc7
             const XMVECTOR part7 = ExtractBC7Partition(blocks, 7, mask7);
             const BC7MultiSubsetEndpointBatch ep7 = ExtractBC7Mode7Endpoints(blocks, mask7);
             const BC7IndexBatch idx7 = ExtractBC7Mode7Indices(blocks, part7, mask7);
-            const BC7QuadrantMeanBatch q7 = ComputeBC7Mode7QuadrantMeans(ep7, part7, idx7, mask7);
+            const BC7QuadrantMeanBatch q7 = ComputeBC7Mode7QuadrantMeans<IsSrgb>(ep7, part7, idx7, mask7);
             for (size_t q = 0; q < 4; ++q)
             {
                 for (size_t c = 0; c < 4; ++c)
@@ -3708,7 +3903,136 @@ namespace // for bc7
         covariance.ba = XMVectorAdd(between.ba, within.ba);
     }
 
+    // Multiply a 4D vector by the symmetric covariance matrix in every SIMD lane.
+    inline BC7BlockMeanBatch MultiplyBC7Covariance(
+        const BC7CovarianceMatrixBatch& covariance,
+        const BC7BlockMeanBatch& vector) noexcept
+    {
+        BC7BlockMeanBatch result{};
+
+        result.value[0] = XMVectorMultiply(covariance.rr, vector.value[0]);
+        result.value[0] = XMVectorMultiplyAdd(covariance.rg, vector.value[1], result.value[0]);
+        result.value[0] = XMVectorMultiplyAdd(covariance.rb, vector.value[2], result.value[0]);
+        result.value[0] = XMVectorMultiplyAdd(covariance.ra, vector.value[3], result.value[0]);
+
+        result.value[1] = XMVectorMultiply(covariance.rg, vector.value[0]);
+        result.value[1] = XMVectorMultiplyAdd(covariance.gg, vector.value[1], result.value[1]);
+        result.value[1] = XMVectorMultiplyAdd(covariance.gb, vector.value[2], result.value[1]);
+        result.value[1] = XMVectorMultiplyAdd(covariance.ga, vector.value[3], result.value[1]);
+
+        result.value[2] = XMVectorMultiply(covariance.rb, vector.value[0]);
+        result.value[2] = XMVectorMultiplyAdd(covariance.gb, vector.value[1], result.value[2]);
+        result.value[2] = XMVectorMultiplyAdd(covariance.bb, vector.value[2], result.value[2]);
+        result.value[2] = XMVectorMultiplyAdd(covariance.ba, vector.value[3], result.value[2]);
+
+        result.value[3] = XMVectorMultiply(covariance.ra, vector.value[0]);
+        result.value[3] = XMVectorMultiplyAdd(covariance.ga, vector.value[1], result.value[3]);
+        result.value[3] = XMVectorMultiplyAdd(covariance.ba, vector.value[2], result.value[3]);
+        result.value[3] = XMVectorMultiplyAdd(covariance.aa, vector.value[3], result.value[3]);
+
+        return result;
+    }
+
+    // Scale a 4D vector to unit length, leaving a vanishing vector at zero.
+    inline BC7BlockMeanBatch NormalizeBC7Vector(const BC7BlockMeanBatch& vector) noexcept
+    {
+        XMVECTOR lengthSquared = XMVectorMultiply(vector.value[0], vector.value[0]);
+        lengthSquared = XMVectorMultiplyAdd(vector.value[1], vector.value[1], lengthSquared);
+        lengthSquared = XMVectorMultiplyAdd(vector.value[2], vector.value[2], lengthSquared);
+        lengthSquared = XMVectorMultiplyAdd(vector.value[3], vector.value[3], lengthSquared);
+        lengthSquared = XMVectorAdd(lengthSquared, XMVectorReplicate(1e-30f));
+
+        const XMVECTOR inverseLength = XMVectorReciprocalSqrt(lengthSquared);
+
+        BC7BlockMeanBatch result{};
+        for (size_t c = 0; c < 4; ++c)
+        {
+            result.value[c] = XMVectorMultiply(vector.value[c], inverseLength);
+        }
+
+        return result;
+    }
+
+    // Estimate the dominant eigenvector of the 4D covariance matrix by power iteration.
+    // A uniform seed is nearly orthogonal to the principal axis of some blocks, which would
+    // collapse the product to noise, so those lanes restart from the axis of largest variance.
+    inline BC7BlockMeanBatch ComputeBC7PrincipalAxis(const BC7CovarianceMatrixBatch& covariance) noexcept
+    {
+        constexpr size_t iterationCount = 3;
+
+        BC7BlockMeanBatch seed{};
+        for (size_t c = 0; c < 4; ++c)
+        {
+            seed.value[c] = XMVectorReplicate(0.5f);
+        }
+
+        const BC7BlockMeanBatch uniformProduct = MultiplyBC7Covariance(covariance, seed);
+
+        XMVECTOR productLengthSquared = XMVectorMultiply(uniformProduct.value[0], uniformProduct.value[0]);
+        productLengthSquared = XMVectorMultiplyAdd(uniformProduct.value[1], uniformProduct.value[1], productLengthSquared);
+        productLengthSquared = XMVectorMultiplyAdd(uniformProduct.value[2], uniformProduct.value[2], productLengthSquared);
+        productLengthSquared = XMVectorMultiplyAdd(uniformProduct.value[3], uniformProduct.value[3], productLengthSquared);
+
+        // The trace bounds the spectral norm, so it sets the scale that "collapsed" is measured against.
+        XMVECTOR trace = XMVectorAdd(covariance.rr, covariance.gg);
+        trace = XMVectorAdd(trace, covariance.bb);
+        trace = XMVectorAdd(trace, covariance.aa);
+        const XMVECTOR collapseLimit = XMVectorScale(XMVectorMultiply(trace, trace), 1e-12f);
+        const XMVECTOR collapsed = XMVectorLess(productLengthSquared, collapseLimit);
+
+        // Fallback seed: the basis vector of the channel holding the most variance.
+        const XMVECTOR maxDiagonal = XMVectorMax(XMVectorMax(covariance.rr, covariance.gg), XMVectorMax(covariance.bb, covariance.aa));
+        const XMVECTOR one = XMVectorReplicate(1.0f);
+        const XMVECTOR zero = XMVectorZero();
+
+        BC7BlockMeanBatch fallback{};
+        fallback.value[0] = XMVectorSelect(zero, one, XMVectorGreaterOrEqual(covariance.rr, maxDiagonal));
+        fallback.value[1] = XMVectorSelect(zero, one, XMVectorGreaterOrEqual(covariance.gg, maxDiagonal));
+        fallback.value[2] = XMVectorSelect(zero, one, XMVectorGreaterOrEqual(covariance.bb, maxDiagonal));
+        fallback.value[3] = XMVectorSelect(zero, one, XMVectorGreaterOrEqual(covariance.aa, maxDiagonal));
+
+        BC7BlockMeanBatch axis{};
+        for (size_t c = 0; c < 4; ++c)
+        {
+            axis.value[c] = XMVectorSelect(uniformProduct.value[c], fallback.value[c], collapsed);
+        }
+        axis = NormalizeBC7Vector(axis);
+
+        // Further iterations sharpen the estimate toward the dominant eigenvector.
+        for (size_t iteration = 1; iteration < iterationCount; ++iteration)
+        {
+            axis = NormalizeBC7Vector(MultiplyBC7Covariance(covariance, axis));
+        }
+
+        return axis;
+    }
+
     // Build the canonical intermediate representation (IR) of the downsampled child block.
+    // Convert one set of linear quadrant means into the code space BC7 endpoints live in.
+    template<bool IsSrgb>
+    inline BC7QuadrantMeanBatch BC7QuadrantsToCodeSpace(const BC7QuadrantMeanBatch& linear) noexcept
+    {
+        if (!IsSrgb)
+        {
+            return linear;
+        }
+
+        BC7QuadrantMeanBatch result{};
+        for (size_t q = 0; q < 4; ++q)
+        {
+            for (size_t c = 0; c < 4; ++c)
+            {
+                result.value[q][c] = BC7LinearToCode<IsSrgb>(linear.value[q][c], c);
+            }
+        }
+
+        return result;
+    }
+
+    // Build the child block IR. Quadrant means arrive in linear light because that is the only
+    // space a box filter is correct in; the canvas itself is held in code space because that is
+    // where endpoint quantization and the palette error metric operate.
+    template<bool IsSrgb>
     inline BC7ChildCanvas BuildBC7ChildCanvas(
         const BC7QuadrantMeanBatch& p00,
         const BC7QuadrantMeanBatch& p10,
@@ -3718,34 +4042,47 @@ namespace // for bc7
     {
         BC7ChildCanvas canvas{};
 
-        // 1. Map parent quadrants to the 16 child texels (RGBA [0, 1] float)
+        // 1. The mean pyramid feeds later mip levels, so its block means stay in linear light.
+        sourceMeans.p00 = ComputeBC7BlockMeans(p00);
+        sourceMeans.p10 = ComputeBC7BlockMeans(p10);
+        sourceMeans.p01 = ComputeBC7BlockMeans(p01);
+        sourceMeans.p11 = ComputeBC7BlockMeans(p11);
+
+        // 2. Re-encode the child texels before any encoder-side statistics are taken.
+        const BC7QuadrantMeanBatch c00 = BC7QuadrantsToCodeSpace<IsSrgb>(p00);
+        const BC7QuadrantMeanBatch c10 = BC7QuadrantsToCodeSpace<IsSrgb>(p10);
+        const BC7QuadrantMeanBatch c01 = BC7QuadrantsToCodeSpace<IsSrgb>(p01);
+        const BC7QuadrantMeanBatch c11 = BC7QuadrantsToCodeSpace<IsSrgb>(p11);
+
+        // 3. Map parent quadrants to the 16 child texels (RGBA [0, 1] float)
         for (size_t c = 0; c < 4; ++c)
         {
-            canvas.texels[0][c]  = p00.value[0][c];
-            canvas.texels[1][c]  = p00.value[1][c];
-            canvas.texels[2][c]  = p10.value[0][c];
-            canvas.texels[3][c]  = p10.value[1][c];
+            canvas.texels[0][c]  = c00.value[0][c];
+            canvas.texels[1][c]  = c00.value[1][c];
+            canvas.texels[2][c]  = c10.value[0][c];
+            canvas.texels[3][c]  = c10.value[1][c];
 
-            canvas.texels[4][c]  = p00.value[2][c];
-            canvas.texels[5][c]  = p00.value[3][c];
-            canvas.texels[6][c]  = p10.value[2][c];
-            canvas.texels[7][c]  = p10.value[3][c];
+            canvas.texels[4][c]  = c00.value[2][c];
+            canvas.texels[5][c]  = c00.value[3][c];
+            canvas.texels[6][c]  = c10.value[2][c];
+            canvas.texels[7][c]  = c10.value[3][c];
 
-            canvas.texels[8][c]  = p01.value[0][c];
-            canvas.texels[9][c]  = p01.value[1][c];
-            canvas.texels[10][c] = p11.value[0][c];
-            canvas.texels[11][c] = p11.value[1][c];
+            canvas.texels[8][c]  = c01.value[0][c];
+            canvas.texels[9][c]  = c01.value[1][c];
+            canvas.texels[10][c] = c11.value[0][c];
+            canvas.texels[11][c] = c11.value[1][c];
 
-            canvas.texels[12][c] = p01.value[2][c];
-            canvas.texels[13][c] = p01.value[3][c];
-            canvas.texels[14][c] = p11.value[2][c];
-            canvas.texels[15][c] = p11.value[3][c];
+            canvas.texels[12][c] = c01.value[2][c];
+            canvas.texels[13][c] = c01.value[3][c];
+            canvas.texels[14][c] = c11.value[2][c];
+            canvas.texels[15][c] = c11.value[3][c];
         }
 
-        // 2. Compute child block mean and 4D ANOVA covariance matrix
-        ComputeBC7ChildBlockMoments(p00, p10, p01, p11, sourceMeans, canvas.mean, canvas.covariance);
+        // 4. Compute child block mean and 4D ANOVA covariance matrix in code space.
+        BC7SourceBlockMeansBatch codeSpaceMeans{};
+        ComputeBC7ChildBlockMoments(c00, c10, c01, c11, codeSpaceMeans, canvas.mean, canvas.covariance);
 
-        // 3. Measure opacity across all 16 child texels (Alpha >= 254.0/255.0)
+        // 5. Measure opacity across all 16 child texels (Alpha >= 254.0/255.0)
         const XMVECTOR alphaThreshold = XMVectorReplicate(254.0f / 255.0f);
         XMVECTOR isOpaque = XMVectorTrueInt();
         for (size_t t = 0; t < 16; ++t)
@@ -3755,40 +4092,8 @@ namespace // for bc7
         }
         canvas.isOpaque = isOpaque;
 
-        // 4. Extract 4D principal axis using power iteration PCA
-        const XMVECTOR diag = XMVectorReplicate(0.5f);
-        BC7BlockMeanBatch next{};
-        next.value[0] = XMVectorMultiply(canvas.covariance.rr, diag);
-        next.value[0] = XMVectorMultiplyAdd(canvas.covariance.rg, diag, next.value[0]);
-        next.value[0] = XMVectorMultiplyAdd(canvas.covariance.rb, diag, next.value[0]);
-        next.value[0] = XMVectorMultiplyAdd(canvas.covariance.ra, diag, next.value[0]);
-
-        next.value[1] = XMVectorMultiply(canvas.covariance.rg, diag);
-        next.value[1] = XMVectorMultiplyAdd(canvas.covariance.gg, diag, next.value[1]);
-        next.value[1] = XMVectorMultiplyAdd(canvas.covariance.gb, diag, next.value[1]);
-        next.value[1] = XMVectorMultiplyAdd(canvas.covariance.ga, diag, next.value[1]);
-
-        next.value[2] = XMVectorMultiply(canvas.covariance.rb, diag);
-        next.value[2] = XMVectorMultiplyAdd(canvas.covariance.gb, diag, next.value[2]);
-        next.value[2] = XMVectorMultiplyAdd(canvas.covariance.bb, diag, next.value[2]);
-        next.value[2] = XMVectorMultiplyAdd(canvas.covariance.ba, diag, next.value[2]);
-
-        next.value[3] = XMVectorMultiply(canvas.covariance.ra, diag);
-        next.value[3] = XMVectorMultiplyAdd(canvas.covariance.ga, diag, next.value[3]);
-        next.value[3] = XMVectorMultiplyAdd(canvas.covariance.ba, diag, next.value[3]);
-        next.value[3] = XMVectorMultiplyAdd(canvas.covariance.aa, diag, next.value[3]);
-
-        XMVECTOR lengthSquared = XMVectorMultiply(next.value[0], next.value[0]);
-        lengthSquared = XMVectorMultiplyAdd(next.value[1], next.value[1], lengthSquared);
-        lengthSquared = XMVectorMultiplyAdd(next.value[2], next.value[2], lengthSquared);
-        lengthSquared = XMVectorMultiplyAdd(next.value[3], next.value[3], lengthSquared);
-        lengthSquared = XMVectorAdd(lengthSquared, XMVectorReplicate(1e-20f));
-
-        const XMVECTOR inverseLength = XMVectorReciprocalSqrt(lengthSquared);
-        canvas.axis.value[0] = XMVectorMultiply(next.value[0], inverseLength);
-        canvas.axis.value[1] = XMVectorMultiply(next.value[1], inverseLength);
-        canvas.axis.value[2] = XMVectorMultiply(next.value[2], inverseLength);
-        canvas.axis.value[3] = XMVectorMultiply(next.value[3], inverseLength);
+        // 6. Extract the 4D principal axis using robust power iteration PCA.
+        canvas.axis = ComputeBC7PrincipalAxis(canvas.covariance);
 
         return canvas;
     }
@@ -3835,6 +4140,15 @@ namespace // for bc7
     };
     constexpr BC7PartitionMaskTable2Subsets g_bc7PartitionMasks2Subsets{};
 
+    // Count set bits of a sixteen-bit partition mask without requiring the POPCNT instruction.
+    inline uint32_t PopCount16(uint32_t value) noexcept
+    {
+        value = value - ((value >> 1) & 0x5555u);
+        value = (value & 0x3333u) + ((value >> 2) & 0x3333u);
+        value = (value + (value >> 4)) & 0x0F0Fu;
+        return (value + (value >> 8)) & 0x1Fu;
+    }
+
     // FasTC-style Hamming distance partition estimation for 2-subset modes.
     // Zero arbitrary thresholds: finds the exact argmin Hamming distance shape!
     inline XMVECTOR EstimateBC7Partition2Subsets(const BC7ChildCanvas& canvas) noexcept
@@ -3871,8 +4185,8 @@ namespace // for bc7
             {
                 const uint16_t shapeMask = g_bc7PartitionMasks2Subsets.mask[s];
                 // Subset polarity invariant: min(popcount(M ^ S), popcount((~M) ^ S))
-                const uint32_t d0 = static_cast<uint32_t>(_mm_popcnt_u32(projMask ^ shapeMask));
-                const uint32_t d1 = static_cast<uint32_t>(_mm_popcnt_u32(invProjMask ^ shapeMask));
+                const uint32_t d0 = PopCount16(static_cast<uint32_t>(projMask ^ shapeMask));
+                const uint32_t d1 = PopCount16(static_cast<uint32_t>(invProjMask ^ shapeMask));
                 const uint32_t d = (d0 < d1) ? d0 : d1;
 
                 if (d < minDistance)
@@ -4294,15 +4608,29 @@ namespace // for bc7
                 maxC[0] = maxC[1] = maxC[2] = 0.0f;
             }
 
-            // In Mode 3, 7-bit + P-bit gives an 8-bit value directly: (val7 << 1) | pBit
+            // In Mode 3, 7-bit + P-bit gives an 8-bit value directly: (val7 << 1) | pBit.
+            // One P-bit serves all three channels of an endpoint, so its value is decided
+            // by a majority vote over the channel LSBs before any channel is quantized.
+            int q0[3]{}, q1[3]{};
+            uint32_t lsbSum0 = 0;
+            uint32_t lsbSum1 = 0;
+
             for (size_t c = 0; c < 3; ++c)
             {
-                const int q0 = std::min(255, std::max(0, static_cast<int>(std::round(minC[c] * 255.0f))));
-                const int q1 = std::min(255, std::max(0, static_cast<int>(std::round(maxC[c] * 255.0f))));
-                ep7[s][0][c] = static_cast<uint8_t>(q0 >> 1);
-                ep7[s][1][c] = static_cast<uint8_t>(q1 >> 1);
-                pBits[s][0] = static_cast<uint8_t>(q0 & 1);
-                pBits[s][1] = static_cast<uint8_t>(q1 & 1);
+                q0[c] = std::min(255, std::max(0, static_cast<int>(std::round(minC[c] * 255.0f))));
+                q1[c] = std::min(255, std::max(0, static_cast<int>(std::round(maxC[c] * 255.0f))));
+                lsbSum0 += static_cast<uint32_t>(q0[c] & 1);
+                lsbSum1 += static_cast<uint32_t>(q1[c] & 1);
+            }
+
+            pBits[s][0] = (lsbSum0 >= 2) ? 1 : 0;
+            pBits[s][1] = (lsbSum1 >= 2) ? 1 : 0;
+
+            for (size_t c = 0; c < 3; ++c)
+            {
+                // Round the 7-bit field so that (field << 1) | pBit lands closest to the target.
+                ep7[s][0][c] = static_cast<uint8_t>(std::min(127, std::max(0, (q0[c] - pBits[s][0] + 1) / 2)));
+                ep7[s][1][c] = static_cast<uint8_t>(std::min(127, std::max(0, (q1[c] - pBits[s][1] + 1) / 2)));
 
                 unquantEP[s][0][c] = UnquantizeBC7_7BitScalar(ep7[s][0][c], pBits[s][0]);
                 unquantEP[s][1][c] = UnquantizeBC7_7BitScalar(ep7[s][1][c], pBits[s][1]);
@@ -4497,14 +4825,28 @@ namespace // for bc7
                 maxC[0] = maxC[1] = maxC[2] = 0.0f;
             }
 
+            // One P-bit serves all three channels of an endpoint, so its value is decided
+            // by a majority vote over the channel LSBs before any channel is quantized.
+            int q0[3]{}, q1[3]{};
+            uint32_t lsbSum0 = 0;
+            uint32_t lsbSum1 = 0;
+
             for (size_t c = 0; c < 3; ++c)
             {
-                const int q0 = std::min(31, std::max(0, static_cast<int>(std::round(minC[c] * 31.0f))));
-                const int q1 = std::min(31, std::max(0, static_cast<int>(std::round(maxC[c] * 31.0f))));
-                ep4[s][0][c] = static_cast<uint8_t>(q0 >> 1);
-                ep4[s][1][c] = static_cast<uint8_t>(q1 >> 1);
-                pBits[s][0] = static_cast<uint8_t>(q0 & 1);
-                pBits[s][1] = static_cast<uint8_t>(q1 & 1);
+                q0[c] = std::min(31, std::max(0, static_cast<int>(std::round(minC[c] * 31.0f))));
+                q1[c] = std::min(31, std::max(0, static_cast<int>(std::round(maxC[c] * 31.0f))));
+                lsbSum0 += static_cast<uint32_t>(q0[c] & 1);
+                lsbSum1 += static_cast<uint32_t>(q1[c] & 1);
+            }
+
+            pBits[s][0] = (lsbSum0 >= 2) ? 1 : 0;
+            pBits[s][1] = (lsbSum1 >= 2) ? 1 : 0;
+
+            for (size_t c = 0; c < 3; ++c)
+            {
+                // Round the 4-bit field so that (field << 1) | pBit lands closest to the target.
+                ep4[s][0][c] = static_cast<uint8_t>(std::min(15, std::max(0, (q0[c] - pBits[s][0] + 1) / 2)));
+                ep4[s][1][c] = static_cast<uint8_t>(std::min(15, std::max(0, (q1[c] - pBits[s][1] + 1) / 2)));
 
                 unquantEP[s][0][c] = UnquantizeBC7_4BitScalar(ep4[s][0][c], pBits[s][0]);
                 unquantEP[s][1][c] = UnquantizeBC7_4BitScalar(ep4[s][1][c], pBits[s][1]);
@@ -4854,14 +5196,28 @@ namespace // for bc7
                 maxC[0] = maxC[1] = maxC[2] = maxC[3] = 0.0f;
             }
 
+            // One P-bit serves all four channels of an endpoint, so its value is decided
+            // by a majority vote over the channel LSBs before any channel is quantized.
+            int q0[4]{}, q1[4]{};
+            uint32_t lsbSum0 = 0;
+            uint32_t lsbSum1 = 0;
+
             for (size_t c = 0; c < 4; ++c)
             {
-                const int q0 = std::min(63, std::max(0, static_cast<int>(std::round(minC[c] * 63.0f))));
-                const int q1 = std::min(63, std::max(0, static_cast<int>(std::round(maxC[c] * 63.0f))));
-                ep5[s][0][c] = static_cast<uint8_t>(q0 >> 1);
-                ep5[s][1][c] = static_cast<uint8_t>(q1 >> 1);
-                pBits[s][0] = static_cast<uint8_t>(q0 & 1);
-                pBits[s][1] = static_cast<uint8_t>(q1 & 1);
+                q0[c] = std::min(63, std::max(0, static_cast<int>(std::round(minC[c] * 63.0f))));
+                q1[c] = std::min(63, std::max(0, static_cast<int>(std::round(maxC[c] * 63.0f))));
+                lsbSum0 += static_cast<uint32_t>(q0[c] & 1);
+                lsbSum1 += static_cast<uint32_t>(q1[c] & 1);
+            }
+
+            pBits[s][0] = (lsbSum0 >= 3) ? 1 : 0;
+            pBits[s][1] = (lsbSum1 >= 3) ? 1 : 0;
+
+            for (size_t c = 0; c < 4; ++c)
+            {
+                // Round the 5-bit field so that (field << 1) | pBit lands closest to the target.
+                ep5[s][0][c] = static_cast<uint8_t>(std::min(31, std::max(0, (q0[c] - pBits[s][0] + 1) / 2)));
+                ep5[s][1][c] = static_cast<uint8_t>(std::min(31, std::max(0, (q1[c] - pBits[s][1] + 1) / 2)));
 
                 unquantEP[s][0][c] = UnquantizeBC7_5BitScalar(ep5[s][0][c], pBits[s][0]);
                 unquantEP[s][1][c] = UnquantizeBC7_5BitScalar(ep5[s][1][c], pBits[s][1]);
@@ -5582,6 +5938,15 @@ namespace // for bc7
         if (validLanes > 3) XMStoreInt4(&blocks[3].x, blockRows.r[3]);
     }
 
+    // Store one linear source-block mean from a SIMD lane into the mean pyramid.
+    inline void StoreBC7BlockMean(const BC7BlockMeanBatch& means, size_t lane, BC7BlockMean& destination) noexcept
+    {
+        destination.r = XMVectorGetByIndex(means.value[0], lane);
+        destination.g = XMVectorGetByIndex(means.value[1], lane);
+        destination.b = XMVectorGetByIndex(means.value[2], lane);
+        destination.a = XMVectorGetByIndex(means.value[3], lane);
+    }
+
     // Dedicated function to evaluate all candidate BC7 modes via Rate-Distortion MSE,
     // pick the winning mode, and store the resulting 128-bit block into destination memory.
     inline uint8_t FitAndStoreBC7ChildBlock(
@@ -5667,12 +6032,15 @@ namespace // for bc7
         return selectedMode;
     }
 
-    // Process one mip-1 block row directly from compressed BC7 Mode 6 parent blocks.
+    // Process one mip-1 block row directly from the compressed BC7 parent blocks.
+    // The recovered parent block means seed the linear mean pyramid that all later levels read,
+    // so no level after this one has to decode a block this encoder itself produced.
+    template<bool IsSrgb>
     inline void ProcessCompressedRowBC7(
         const Image& source,
         Image& destination,
         size_t destinationRow,
-        BC7BlockMean* sourceBlockMeans = nullptr) noexcept
+        BC7BlockMean* sourceBlockMeans) noexcept
     {
         constexpr size_t laneCount = 4;
         const size_t sourceBlockWidth = std::max<size_t>(1, (source.width + 3) / 4);
@@ -5718,15 +6086,15 @@ namespace // for bc7
             const BC7BlockBatch b01 = LoadBC7BlockBatch(p01Blocks);
             const BC7BlockBatch b11 = LoadBC7BlockBatch(p11Blocks);
 
-            // 2. Compute exact UNORM quadrant means across parent modes (Mode 1, Mode 6)
-            const BC7QuadrantMeanBatch q00 = ComputeBC7ParentQuadrantMeans(b00, activeMask);
-            const BC7QuadrantMeanBatch q10 = ComputeBC7ParentQuadrantMeans(b10, activeMask);
-            const BC7QuadrantMeanBatch q01 = ComputeBC7ParentQuadrantMeans(b01, activeMask);
-            const BC7QuadrantMeanBatch q11 = ComputeBC7ParentQuadrantMeans(b11, activeMask);
+            // 2. Compute exact linear quadrant means across all parent modes
+            const BC7QuadrantMeanBatch q00 = ComputeBC7ParentQuadrantMeans<IsSrgb>(b00, activeMask);
+            const BC7QuadrantMeanBatch q10 = ComputeBC7ParentQuadrantMeans<IsSrgb>(b10, activeMask);
+            const BC7QuadrantMeanBatch q01 = ComputeBC7ParentQuadrantMeans<IsSrgb>(b01, activeMask);
+            const BC7QuadrantMeanBatch q11 = ComputeBC7ParentQuadrantMeans<IsSrgb>(b11, activeMask);
 
             // 3. Build child canonical canvas (16 texels, moments, 4D axis, opacity)
             BC7SourceBlockMeansBatch sourceMeans{};
-            const BC7ChildCanvas canvas = BuildBC7ChildCanvas(q00, q10, q01, q11, sourceMeans);
+            const BC7ChildCanvas canvas = BuildBC7ChildCanvas<IsSrgb>(q00, q10, q01, q11, sourceMeans);
 
             // 4. Fit Mode 6 endpoints and 4-bit indices
             const BC7EndpointPairFloatBatch floatEndpoints = ComputeInitialEndpointsBC7Mode6PCA(canvas);
@@ -5752,73 +6120,9 @@ namespace // for bc7
             alignas(16) uint32_t opaqueLanes[4]{};
             _mm_store_si128(reinterpret_cast<__m128i*>(opaqueLanes), _mm_castps_si128(canvas.isOpaque));
 
-            // 6. Pure Rate-Distortion MSE comparison: min(E_0, E_1, E_2, E_3, E_6) without arbitrary thresholds
             // 6. Rate-Distortion mode evaluation and child block storage for all lanes
             for (size_t lane = 0; lane < validLanes; ++lane)
             {
-                const bool isOpaque = (opaqueLanes[lane] != 0);
-                const float e6 = XMVectorGetByIndex(errorMode6, lane);
-
-                if (isOpaque)
-                {
-                    const BC7Mode0FitResult m0 = FitBC7Mode0SingleLane(canvas, part3SMode0Lanes[lane], lane);
-                    const BC7Mode1FitResult m1 = FitBC7Mode1SingleLane(canvas, part2SLanes[lane], lane);
-                    const BC7Mode2FitResult m2 = FitBC7Mode2SingleLane(canvas, part3SMode2Lanes[lane], lane);
-                    const BC7Mode3FitResult m3 = FitBC7Mode3SingleLane(canvas, part2SLanes[lane], lane);
-
-                    float minError = e6;
-                    XMUINT4 bestBlock = mode6Blocks[lane];
-
-                    if (m0.totalError < minError)
-                    {
-                        minError = m0.totalError;
-                        bestBlock = m0.block;
-                    }
-                    if (m1.totalError < minError)
-                    {
-                        minError = m1.totalError;
-                        bestBlock = m1.block;
-                    }
-                    if (m2.totalError < minError)
-                    {
-                        minError = m2.totalError;
-                        bestBlock = m2.block;
-                    }
-                    if (m3.totalError < minError)
-                    {
-                        minError = m3.totalError;
-                        bestBlock = m3.block;
-                    }
-
-                    destinationBlocks[destinationX + lane] = bestBlock;
-                    continue;
-                }
-
-                // Block has varying alpha: 4-way Rate-Distortion MSE comparison min(E_4, E_5, E_6, E_7)
-                const BC7Mode7FitResult m7 = FitBC7Mode7SingleLane(canvas, part2SLanes[lane], lane);
-                const BC7Mode4FitResult m4 = FitBC7Mode4SingleLane(canvas, lane);
-                const BC7Mode5FitResult m5 = FitBC7Mode5SingleLane(canvas, lane);
-
-                float minAlphaError = e6;
-                XMUINT4 bestAlphaBlock = mode6Blocks[lane];
-
-                if (m7.totalError < minAlphaError)
-                {
-                    minAlphaError = m7.totalError;
-                    bestAlphaBlock = m7.block;
-                }
-                if (m4.totalError < minAlphaError)
-                {
-                    minAlphaError = m4.totalError;
-                    bestAlphaBlock = m4.block;
-                }
-                if (m5.totalError < minAlphaError)
-                {
-                    minAlphaError = m5.totalError;
-                    bestAlphaBlock = m5.block;
-                }
-
-                destinationBlocks[destinationX + lane] = bestAlphaBlock;
                 FitAndStoreBC7ChildBlock(
                     &destinationBlocks[destinationX + lane],
                     canvas,
@@ -5826,10 +6130,172 @@ namespace // for bc7
                     part3SMode0Lanes[lane],
                     part3SMode2Lanes[lane],
                     mode6Blocks[lane],
-                    e6,
-                    isOpaque,
-                    lane
-                );
+                    XMVectorGetByIndex(errorMode6, lane),
+                    opaqueLanes[lane] != 0,
+                    lane);
+            }
+
+            // 7. Retain the recovered parent block means for the higher-level pyramid.
+            if (sourceBlockMeans)
+            {
+                for (size_t lane = 0; lane < validLanes; ++lane)
+                {
+                    const size_t childX = destinationX + lane;
+                    const size_t sourceX0 = std::min(childX * 2, sourceBlockWidth - 1);
+                    const size_t sourceX1 = std::min(sourceX0 + 1, sourceBlockWidth - 1);
+
+                    // Clamped addressing can make two parents refer to the same source block.
+                    StoreBC7BlockMean(sourceMeans.p00, lane, sourceBlockMeans[sourceY0 * sourceBlockWidth + sourceX0]);
+
+                    if (sourceX1 != sourceX0)
+                    {
+                        StoreBC7BlockMean(sourceMeans.p10, lane, sourceBlockMeans[sourceY0 * sourceBlockWidth + sourceX1]);
+                    }
+
+                    if (sourceY1 != sourceY0)
+                    {
+                        StoreBC7BlockMean(sourceMeans.p01, lane, sourceBlockMeans[sourceY1 * sourceBlockWidth + sourceX0]);
+                        if (sourceX1 != sourceX0)
+                        {
+                            StoreBC7BlockMean(sourceMeans.p11, lane, sourceBlockMeans[sourceY1 * sourceBlockWidth + sourceX1]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Halve one row of the linear block-mean image with edge clamping.
+    inline void DownsampleBC7MeanRow(
+        const BC7BlockMean* source,
+        size_t sourceWidth,
+        size_t sourceHeight,
+        BC7BlockMean* destination,
+        size_t destinationWidth,
+        size_t destinationRow) noexcept
+    {
+        // Select two source rows and repeat the final row when the height is odd.
+        const size_t sourceY0 = destinationRow * 2;
+        const size_t sourceY1 = std::min(sourceY0 + 1, sourceHeight - 1);
+        const auto* sourceRow0 = source + sourceY0 * sourceWidth;
+        const auto* sourceRow1 = source + sourceY1 * sourceWidth;
+        auto* destinationRowPtr = destination + destinationRow * destinationWidth;
+
+        for (size_t destinationX = 0; destinationX < destinationWidth; ++destinationX)
+        {
+            const size_t sourceX0 = destinationX * 2;
+            const size_t sourceX1 = std::min(sourceX0 + 1, sourceWidth - 1);
+
+            const auto& s00 = sourceRow0[sourceX0];
+            const auto& s10 = sourceRow0[sourceX1];
+            const auto& s01 = sourceRow1[sourceX0];
+            const auto& s11 = sourceRow1[sourceX1];
+
+            auto& output = destinationRowPtr[destinationX];
+            output.r = (s00.r + s10.r + s01.r + s11.r) * 0.25f;
+            output.g = (s00.g + s10.g + s01.g + s11.g) * 0.25f;
+            output.b = (s00.b + s10.b + s01.b + s11.b) * 0.25f;
+            output.a = (s00.a + s10.a + s01.a + s11.a) * 0.25f;
+        }
+    }
+
+    // Fetch one mean texel with clamp-to-edge addressing.
+    inline const BC7BlockMean& FetchBC7Mean(
+        const BC7BlockMean* source,
+        size_t width,
+        size_t height,
+        size_t x,
+        size_t y) noexcept
+    {
+        return source[std::min(y, height - 1) * width + std::min(x, width - 1)];
+    }
+
+    // Encode one destination row from the linear block-mean image.
+    template<bool IsSrgb>
+    inline void ProcessLinearRowBC7(
+        const BC7BlockMean* source,
+        size_t sourceWidth,
+        size_t sourceHeight,
+        Image& destination,
+        size_t destinationRow) noexcept
+    {
+        constexpr size_t laneCount = 4;
+        const size_t destinationBlockWidth = std::max<size_t>(1, (destination.width + 3) / 4);
+        auto* destinationBlocks = reinterpret_cast<XMUINT4*>(destination.pixels + destinationRow * destination.rowPitch);
+
+        for (size_t destinationX = 0; destinationX < destinationBlockWidth; destinationX += laneCount)
+        {
+            // Each region holds the four samples belonging to one 2x2 output quadrant.
+            BC7QuadrantMeanBatch regions[4]{};
+            const size_t validLanes = std::min(laneCount, destinationBlockWidth - destinationX);
+
+            const XMVECTOR activeMask = XMVectorSetInt(
+                0 < validLanes ? 0xFFFFFFFFu : 0,
+                1 < validLanes ? 0xFFFFFFFFu : 0,
+                2 < validLanes ? 0xFFFFFFFFu : 0,
+                3 < validLanes ? 0xFFFFFFFFu : 0
+            );
+
+            for (size_t lane = 0; lane < validLanes; ++lane)
+            {
+                const size_t blockX = destinationX + lane;
+                const size_t texelBaseX = blockX * 4;
+                const size_t texelBaseY = destinationRow * 4;
+
+                for (size_t localY = 0; localY < 4; ++localY)
+                {
+                    for (size_t localX = 0; localX < 4; ++localX)
+                    {
+                        // The mean pyramid grid already matches this level's texel grid.
+                        const size_t region = ((localY >> 1) << 1) + (localX >> 1);
+                        const size_t sample = ((localY & 1) << 1) + (localX & 1);
+                        const BC7BlockMean& color = FetchBC7Mean(source, sourceWidth, sourceHeight, texelBaseX + localX, texelBaseY + localY);
+
+                        regions[region].value[sample][0] = XMVectorSetByIndex(regions[region].value[sample][0], color.r, lane);
+                        regions[region].value[sample][1] = XMVectorSetByIndex(regions[region].value[sample][1], color.g, lane);
+                        regions[region].value[sample][2] = XMVectorSetByIndex(regions[region].value[sample][2], color.b, lane);
+                        regions[region].value[sample][3] = XMVectorSetByIndex(regions[region].value[sample][3], color.a, lane);
+                    }
+                }
+            }
+
+            BC7SourceBlockMeansBatch unusedMeans{};
+            const BC7ChildCanvas canvas = BuildBC7ChildCanvas<IsSrgb>(regions[0], regions[1], regions[2], regions[3], unusedMeans);
+
+            const BC7EndpointPairFloatBatch floatEndpoints = ComputeInitialEndpointsBC7Mode6PCA(canvas);
+            BC7EndpointPairBatch quantizedEndpoints = QuantizeBC7Mode6Endpoints(floatEndpoints);
+            XMVECTOR errorMode6 = XMVectorZero();
+            const BC7Mode6PackedIndexBatch childIndices = AssignBC7Mode6Indices(canvas, quantizedEndpoints, activeMask, &errorMode6);
+            const BC7BlockBatch mode6Encoded = EmitBC7Mode6BlockBatch(quantizedEndpoints, childIndices);
+
+            alignas(16) XMUINT4 mode6Blocks[4]{};
+            StoreBC7BlockBatch(mode6Blocks, mode6Encoded, validLanes);
+
+            const XMVECTOR part2S = EstimateBC7Partition2Subsets(canvas);
+            alignas(16) uint32_t part2SLanes[4]{};
+            _mm_store_si128(reinterpret_cast<__m128i*>(part2SLanes), _mm_castps_si128(part2S));
+
+            const BC7Partition3SubsetsResult part3S = EstimateBC7Partition3Subsets(canvas);
+            alignas(16) uint32_t part3SMode0Lanes[4]{};
+            alignas(16) uint32_t part3SMode2Lanes[4]{};
+            _mm_store_si128(reinterpret_cast<__m128i*>(part3SMode0Lanes), _mm_castps_si128(part3S.mode0Shape));
+            _mm_store_si128(reinterpret_cast<__m128i*>(part3SMode2Lanes), _mm_castps_si128(part3S.mode2Shape));
+
+            alignas(16) uint32_t opaqueLanes[4]{};
+            _mm_store_si128(reinterpret_cast<__m128i*>(opaqueLanes), _mm_castps_si128(canvas.isOpaque));
+
+            for (size_t lane = 0; lane < validLanes; ++lane)
+            {
+                FitAndStoreBC7ChildBlock(
+                    &destinationBlocks[destinationX + lane],
+                    canvas,
+                    part2SLanes[lane],
+                    part3SMode0Lanes[lane],
+                    part3SMode2Lanes[lane],
+                    mode6Blocks[lane],
+                    XMVectorGetByIndex(errorMode6, lane),
+                    opaqueLanes[lane] != 0,
+                    lane);
             }
         }
     }
@@ -5857,31 +6323,91 @@ namespace // for bc7
     }
 
     // Generate all compressed BC7 mip levels after level zero.
+    template<bool IsSrgb>
     inline HRESULT GenerateCompressedMipMapsBC7(const Image& baseImage, ScratchImage& mipChain) noexcept
     {
+        // Level 0 is already present, so a one-level chain requires no generation work.
         const size_t mipLevels = mipChain.GetMetadata().mipLevels;
         if (mipLevels <= 1)
         {
             return S_OK;
         }
 
+        // Initialize the shared lookup table before entering an OpenMP region.
+        if (IsSrgb)
+        {
+            (void)GetSrgb8ToLinearTable();
+        }
+
+        const size_t baseBlockWidth = std::max<size_t>(1, (baseImage.width + 3) / 4);
+        const size_t baseBlockHeight = std::max<size_t>(1, (baseImage.height + 3) / 4);
+        std::unique_ptr<BC7BlockMean[]> meanImage;
+        std::unique_ptr<BC7BlockMean[]> meanScratch;
+
+        // Mip 1 is direct; later levels require two ping-pong linear-mean buffers.
+        if (mipLevels > 2)
+        {
+            const size_t meanCount = baseBlockWidth * baseBlockHeight;
+            const size_t scratchWidth = (baseBlockWidth + 1) / 2;
+            const size_t scratchHeight = (baseBlockHeight + 1) / 2;
+            meanImage.reset(new (std::nothrow) BC7BlockMean[meanCount]{});
+            meanScratch.reset(new (std::nothrow) BC7BlockMean[scratchWidth * scratchHeight]{});
+            if (!meanImage || !meanScratch)
+            {
+                return E_OUTOFMEMORY;
+            }
+        }
+
+        BC7BlockMean* meanFront = meanImage.get();
+        BC7BlockMean* meanBack = meanScratch.get();
+        size_t meanWidth = baseBlockWidth;
+        size_t meanHeight = baseBlockHeight;
+
+        // Every level below mip 1 reads the linear mean pyramid rather than this encoder's own
+        // output, so quantization error cannot compound from one generated level to the next.
         for (size_t mipLevel = 1; mipLevel < mipLevels; ++mipLevel)
         {
-            const Image* source = (mipLevel == 1) ? &baseImage : mipChain.GetImage(mipLevel - 1, 0, 0);
             Image* destination = const_cast<Image*>(mipChain.GetImage(mipLevel, 0, 0));
-            if (!source || !source->pixels || !destination || !destination->pixels)
+            if (!destination || !destination->pixels)
             {
                 return E_FAIL;
             }
 
             const size_t destinationBlockHeight = std::max<size_t>(1, (destination->height + 3) / 4);
 
+            // Before mip 3 and later, halve the mean pyramid to the required scale.
+            if (mipLevel >= 3)
+            {
+                const size_t nextWidth = (meanWidth + 1) / 2;
+                const size_t nextHeight = (meanHeight + 1) / 2;
+
+            #ifdef _OPENMP
+            #pragma omp parallel for
+            #endif
+                for (ptrdiff_t row = 0; row < static_cast<ptrdiff_t>(nextHeight); ++row)
+                {
+                    DownsampleBC7MeanRow(meanFront, meanWidth, meanHeight, meanBack, nextWidth, static_cast<size_t>(row));
+                }
+
+                std::swap(meanFront, meanBack);
+                meanWidth = nextWidth;
+                meanHeight = nextHeight;
+            }
+
         #ifdef _OPENMP
         #pragma omp parallel for
         #endif
             for (ptrdiff_t row = 0; row < static_cast<ptrdiff_t>(destinationBlockHeight); ++row)
             {
-                ProcessCompressedRowBC7(*source, *destination, static_cast<size_t>(row));
+                // Only mip 1 reads BC7 parents; later levels read the linear mean pyramid.
+                if (mipLevel == 1)
+                {
+                    ProcessCompressedRowBC7<IsSrgb>(baseImage, *destination, static_cast<size_t>(row), meanFront);
+                }
+                else
+                {
+                    ProcessLinearRowBC7<IsSrgb>(meanFront, meanWidth, meanHeight, *destination, static_cast<size_t>(row));
+                }
             }
         }
 
@@ -5962,8 +6488,10 @@ HRESULT DirectX::GenerateCompressedMipMaps(const Image& baseImage, size_t levels
         return GenerateCompressedMipMapsBC1<true>(baseImage, mipChain);
 
     case DXGI_FORMAT_BC7_UNORM:
+        return GenerateCompressedMipMapsBC7<false>(baseImage, mipChain);
+
     case DXGI_FORMAT_BC7_UNORM_SRGB:
-        return GenerateCompressedMipMapsBC7(baseImage, mipChain);
+        return GenerateCompressedMipMapsBC7<true>(baseImage, mipChain);
 
     case DXGI_FORMAT_BC4_UNORM:
         return GenerateCompressedMipMapsBC4(baseImage, mipChain);
