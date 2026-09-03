@@ -1428,6 +1428,604 @@ namespace // for bc1
 
 namespace // for bc4
 {
+    // Lee: A BC4 block stores two 8-bit endpoints followed by sixteen 3-bit indices.
+    struct BC4Block
+    {
+        uint8_t red0;
+        uint8_t red1;
+        uint8_t indices[6];
+    };
+
+    static_assert(sizeof(BC4Block) == 8, "BC4Block must be 8 bytes");
+
+    // Lee: One scalar mean per source block, the material of the mean pyramid.
+    using BC4BlockMean = float;
+
+    // Lee: Sixteen texel values of one destination block, four per SIMD register.
+    struct BC4TexelBlock
+    {
+        XMVECTOR rows[4];
+    };
+
+    // Integer palette weights of the six-interpolated mode, j = [0, 7, 1, 2, 3, 4, 5, 6].
+    // Palette entry k decodes to ((7 - j[k]) * red0 + j[k] * red1) / (7 * 255).
+    constexpr uint8_t g_bc4SixInterpWeights[8] = { 0, 7, 1, 2, 3, 4, 5, 6 };
+
+    // Ramp position p counts steps away from red1, so index k = g_bc4RampToIndex[p].
+    constexpr uint8_t g_bc4RampToIndex[8] = { 1, 7, 6, 5, 4, 3, 2, 0 };
+
+    // A quadrant mean divides the palette sum by four, and the palette itself by 7 * 255.
+    constexpr float g_bc4QuadrantScale = 1.0f / (4.0f * 7.0f * 255.0f);
+
+    // Read one BC4 block as a single 64-bit word without assuming source alignment.
+    inline uint64_t LoadBC4Block(const BC4Block& block) noexcept
+    {
+        uint64_t data;
+        memcpy(&data, &block, sizeof(data));
+        return data;
+    }
+
+    // Write one BC4 block from its packed 64-bit representation.
+    inline void StoreBC4Block(uint64_t data, BC4Block& block) noexcept
+    {
+        memcpy(&block, &data, sizeof(data));
+    }
+
+    // Build the twelve-bit row table that folds four texel indices into two pair sums.
+    inline const std::array<uint16_t, 4096>& GetBC4RowWeightTable() noexcept
+    {
+        // Function-local static initialization builds this table only once and is thread-safe.
+        static const std::array<uint16_t, 4096> table = []
+            {
+                std::array<uint16_t, 4096> values{};
+
+                // A BC4 index row occupies exactly twelve bits, so one entry covers four texels.
+                for (size_t group = 0; group < values.size(); ++group)
+                {
+                    const uint32_t j0 = g_bc4SixInterpWeights[(group >> 0) & 0x07];
+                    const uint32_t j1 = g_bc4SixInterpWeights[(group >> 3) & 0x07];
+                    const uint32_t j2 = g_bc4SixInterpWeights[(group >> 6) & 0x07];
+                    const uint32_t j3 = g_bc4SixInterpWeights[(group >> 9) & 0x07];
+
+                    // The low byte holds the left quadrant pair and the high byte the right one.
+                    values[group] = static_cast<uint16_t>((j0 + j1) | ((j2 + j3) << 8));
+                }
+
+                return values;
+            }();
+
+            // Quadrant symbols then cost four table reads plus four additions per block.
+        return table;
+    }
+
+    // Rebuild the eight palette values of a block that uses the four-interpolated mode.
+    inline void BuildBC4FourInterpPalette(uint32_t red0, uint32_t red1, float palette[8]) noexcept
+    {
+        constexpr float scale = 1.0f / 255.0f;
+        const float fred0 = static_cast<float>(red0) * scale;
+        const float fred1 = static_cast<float>(red1) * scale;
+
+        palette[0] = fred0;
+        palette[1] = fred1;
+
+        // Entries two through five interpolate on a five-step ramp.
+        for (size_t index = 2; index < 6; ++index)
+        {
+            const float weight = static_cast<float>(index - 1);
+            palette[index] = (fred0 * (5.0f - weight) + fred1 * weight) * (1.0f / 5.0f);
+        }
+
+        // Entries six and seven are absolute values that do not depend on the endpoints.
+        palette[6] = 0.0f;
+        palette[7] = 1.0f;
+    }
+
+    // Recover the four quadrant means of one compressed BC4 block.
+    inline void DecodeBC4QuadrantMeans(uint64_t data, float quadrants[4]) noexcept
+    {
+        const uint32_t red0 = static_cast<uint32_t>(data & 0xFFu);
+        const uint32_t red1 = static_cast<uint32_t>((data >> 8) & 0xFFu);
+        const uint64_t indices = data >> 16;
+
+        if (red0 > red1)
+        {
+            // Six-interpolated mode keeps every palette entry affine in the endpoints,
+            // so one integer symbol per quadrant carries all of the information.
+            const auto& table = GetBC4RowWeightTable();
+            const uint32_t row0 = table[static_cast<size_t>((indices >> 0) & 0xFFFu)];
+            const uint32_t row1 = table[static_cast<size_t>((indices >> 12) & 0xFFFu)];
+            const uint32_t row2 = table[static_cast<size_t>((indices >> 24) & 0xFFFu)];
+            const uint32_t row3 = table[static_cast<size_t>((indices >> 36) & 0xFFFu)];
+
+            // Quadrants zero and one live in the first two rows, two and three in the last two.
+            const uint32_t topPairs = row0 + row1;
+            const uint32_t bottomPairs = row2 + row3;
+            const uint32_t symbols[4] =
+            {
+                topPairs & 0xFFu,
+                (topPairs >> 8) & 0xFFu,
+                bottomPairs & 0xFFu,
+                (bottomPairs >> 8) & 0xFFu,
+            };
+
+            // Theorem 1': four texels sum to ((28 - J) * red0 + J * red1) / (7 * 255).
+            for (size_t quadrant = 0; quadrant < 4; ++quadrant)
+            {
+                const uint32_t symbol = symbols[quadrant];
+                const uint32_t weighted = (28u - symbol) * red0 + symbol * red1;
+                quadrants[quadrant] = static_cast<float>(weighted) * g_bc4QuadrantScale;
+            }
+        }
+        else
+        {
+            // Four-interpolated mode breaks the affine form, so decode its texels directly.
+            float palette[8];
+            BuildBC4FourInterpPalette(red0, red1, palette);
+
+            for (size_t quadrant = 0; quadrant < 4; ++quadrant)
+            {
+                // Quadrant q covers two texel columns on two consecutive texel rows.
+                const size_t baseTexel = ((quadrant >> 1) << 3) + ((quadrant & 1) << 1);
+                float sum = 0.0f;
+
+                for (size_t localY = 0; localY < 2; ++localY)
+                {
+                    for (size_t localX = 0; localX < 2; ++localX)
+                    {
+                        const size_t texel = baseTexel + localY * 4 + localX;
+                        const size_t index = static_cast<size_t>((indices >> (3 * texel)) & 0x07u);
+                        sum += palette[index];
+                    }
+                }
+
+                quadrants[quadrant] = sum * 0.25f;
+            }
+        }
+    }
+
+    // Add the four lanes of a SIMD register.
+    inline float HorizontalSumBC4(FXMVECTOR value) noexcept
+    {
+        XMVECTOR folded = _mm_add_ps(value, _mm_movehl_ps(value, value));
+        folded = _mm_add_ss(folded, _mm_shuffle_ps(folded, folded, _MM_SHUFFLE(1, 1, 1, 1)));
+        return _mm_cvtss_f32(folded);
+    }
+
+    // Take the smallest of the four lanes of a SIMD register.
+    inline float HorizontalMinBC4(FXMVECTOR value) noexcept
+    {
+        XMVECTOR folded = _mm_min_ps(value, _mm_movehl_ps(value, value));
+        folded = _mm_min_ss(folded, _mm_shuffle_ps(folded, folded, _MM_SHUFFLE(1, 1, 1, 1)));
+        return _mm_cvtss_f32(folded);
+    }
+
+    // Take the largest of the four lanes of a SIMD register.
+    inline float HorizontalMaxBC4(FXMVECTOR value) noexcept
+    {
+        XMVECTOR folded = _mm_max_ps(value, _mm_movehl_ps(value, value));
+        folded = _mm_max_ss(folded, _mm_shuffle_ps(folded, folded, _MM_SHUFFLE(1, 1, 1, 1)));
+        return _mm_cvtss_f32(folded);
+    }
+
+    // Accumulated one-dimensional least-squares moments of one block.
+    struct BC4LeastSquaresMoments
+    {
+        float sumY;
+        float sumW;
+        float sumW2;
+        float sumWY;
+    };
+
+    // Snap every texel to the closest ramp position and accumulate the least-squares moments.
+    inline BC4LeastSquaresMoments AccumulateBC4Moments(
+        const BC4TexelBlock& texels,
+        float endpoint0,
+        float endpoint1) noexcept
+    {
+        // Ramp position zero sits on endpoint0 and position seven on endpoint1.
+        const float inverseSpan = 7.0f / (endpoint1 - endpoint0);
+        const XMVECTOR multiplier = XMVectorReplicate(inverseSpan);
+        const XMVECTOR offset = XMVectorReplicate(-endpoint0 * inverseSpan);
+        const XMVECTOR lowerBound = XMVectorZero();
+        const XMVECTOR upperBound = XMVectorReplicate(7.0f);
+        const XMVECTOR weightScale = XMVectorReplicate(1.0f / 7.0f);
+
+        XMVECTOR sumY = XMVectorZero();
+        XMVECTOR sumW = XMVectorZero();
+        XMVECTOR sumW2 = XMVectorZero();
+        XMVECTOR sumWY = XMVectorZero();
+
+        for (size_t row = 0; row < 4; ++row)
+        {
+            const XMVECTOR values = texels.rows[row];
+
+            // Quantized ramp position of every texel, clamped into the representable range.
+            XMVECTOR position = XMVectorMultiplyAdd(values, multiplier, offset);
+            position = XMVectorClamp(position, lowerBound, upperBound);
+            position = XMVectorRound(position);
+
+            const XMVECTOR weights = XMVectorMultiply(position, weightScale);
+            sumY = XMVectorAdd(sumY, values);
+            sumW = XMVectorAdd(sumW, weights);
+            sumW2 = XMVectorMultiplyAdd(weights, weights, sumW2);
+            sumWY = XMVectorMultiplyAdd(weights, values, sumWY);
+        }
+
+        BC4LeastSquaresMoments moments;
+        moments.sumY = HorizontalSumBC4(sumY);
+        moments.sumW = HorizontalSumBC4(sumW);
+        moments.sumW2 = HorizontalSumBC4(sumW2);
+        moments.sumWY = HorizontalSumBC4(sumWY);
+        return moments;
+    }
+
+    // Solve the two by two normal equations of the segment that fits the block.
+    inline void SolveBC4Endpoints(
+        const BC4LeastSquaresMoments& moments,
+        float& endpoint0,
+        float& endpoint1) noexcept
+    {
+        constexpr float texelCount = 16.0f;
+        const float determinant = texelCount * moments.sumW2 - moments.sumW * moments.sumW;
+
+        // A vanishing determinant means every texel landed on the same ramp position.
+        if (std::fabs(determinant) < 1e-9f)
+        {
+            const float mean = moments.sumY * (1.0f / texelCount);
+            endpoint0 = mean;
+            endpoint1 = mean;
+            return;
+        }
+
+        // Unlike coordinate descent, this solves both endpoints at once and needs no iteration.
+        const float inverseDeterminant = 1.0f / determinant;
+        const float intercept = (moments.sumW2 * moments.sumY - moments.sumW * moments.sumWY) * inverseDeterminant;
+        const float direction = (texelCount * moments.sumWY - moments.sumW * moments.sumY) * inverseDeterminant;
+
+        endpoint0 = std::min(std::max(intercept, 0.0f), 1.0f);
+        endpoint1 = std::min(std::max(intercept + direction, 0.0f), 1.0f);
+    }
+
+    // Convert one endpoint from normalized form to its eight-bit code with rounding.
+    inline uint32_t QuantizeBC4Endpoint(float value) noexcept
+    {
+        // Rounding removes the half-LSB bias that truncation would introduce.
+        const float scaled = std::min(std::max(value, 0.0f), 1.0f) * 255.0f + 0.5f;
+        return static_cast<uint32_t>(scaled);
+    }
+
+    // Assign the closest palette index to every texel of a six-interpolated block.
+    inline uint64_t AssignBC4Indices(const BC4TexelBlock& texels, uint32_t red0, uint32_t red1) noexcept
+    {
+        // Equal endpoints leave a single palette value, which index zero already reproduces.
+        if (red0 == red1)
+        {
+            return 0;
+        }
+
+        // Closed form of the nearest ramp position on an evenly spaced eight-entry palette.
+        const float inverseSpan = 1.0f / static_cast<float>(red0 - red1);
+        const XMVECTOR multiplier = XMVectorReplicate(255.0f * 7.0f * inverseSpan);
+        const XMVECTOR offset = XMVectorReplicate(-7.0f * static_cast<float>(red1) * inverseSpan);
+        const XMVECTOR lowerBound = XMVectorZero();
+        const XMVECTOR upperBound = XMVectorReplicate(7.0f);
+
+        uint64_t packed = 0;
+
+        for (size_t row = 0; row < 4; ++row)
+        {
+            XMVECTOR position = XMVectorMultiplyAdd(texels.rows[row], multiplier, offset);
+            position = XMVectorClamp(position, lowerBound, upperBound);
+
+            // Converting to integer rounds to nearest, which selects the closest ramp position.
+            alignas(16) int32_t positions[4];
+            _mm_store_si128(reinterpret_cast<__m128i*>(positions), _mm_cvtps_epi32(position));
+
+            // One row of four texels occupies exactly twelve bits of the index field.
+            uint32_t group = 0;
+            for (size_t lane = 0; lane < 4; ++lane)
+            {
+                const uint32_t index = g_bc4RampToIndex[static_cast<size_t>(positions[lane]) & 0x07u];
+                group |= index << (3 * lane);
+            }
+
+            packed |= static_cast<uint64_t>(group) << (12 * row);
+        }
+
+        return packed;
+    }
+
+    // Encode sixteen texel values into one BC4 block using the six-interpolated mode.
+    inline uint64_t EncodeBC4Block(const BC4TexelBlock& texels) noexcept
+    {
+        // Two passes suffice because the min and max seed already lies close to the optimum.
+        constexpr size_t refinementPasses = 2;
+        constexpr float degenerateSpan = 1.0f / 512.0f;
+
+        const XMVECTOR minimum = XMVectorMin(XMVectorMin(texels.rows[0], texels.rows[1]), XMVectorMin(texels.rows[2], texels.rows[3]));
+        const XMVECTOR maximum = XMVectorMax(XMVectorMax(texels.rows[0], texels.rows[1]), XMVectorMax(texels.rows[2], texels.rows[3]));
+
+        // A single channel has no principal axis, so the extremes seed the segment directly.
+        float endpoint0 = std::min(std::max(HorizontalMaxBC4(maximum), 0.0f), 1.0f);
+        float endpoint1 = std::min(std::max(HorizontalMinBC4(minimum), 0.0f), 1.0f);
+
+        for (size_t pass = 0; pass < refinementPasses; ++pass)
+        {
+            // A flat block defines no direction, so keep the value it already carries.
+            if (endpoint0 - endpoint1 < degenerateSpan)
+            {
+                break;
+            }
+
+            const BC4LeastSquaresMoments moments = AccumulateBC4Moments(texels, endpoint0, endpoint1);
+            float refined0 = endpoint0;
+            float refined1 = endpoint1;
+            SolveBC4Endpoints(moments, refined0, refined1);
+
+            // The six-interpolated mode requires red0 > red1, so keep the larger value first.
+            if (refined1 > refined0)
+            {
+                std::swap(refined0, refined1);
+            }
+
+            endpoint0 = refined0;
+            endpoint1 = refined1;
+        }
+
+        uint32_t red0 = QuantizeBC4Endpoint(endpoint0);
+        uint32_t red1 = QuantizeBC4Endpoint(endpoint1);
+
+        // Rounding can invert the order of two endpoints that share one code.
+        if (red0 < red1)
+        {
+            std::swap(red0, red1);
+        }
+
+        // Equal endpoints decode through the four-interpolated mode, where index zero is exact.
+        const uint64_t indices = AssignBC4Indices(texels, red0, red1);
+        return static_cast<uint64_t>(red0) | (static_cast<uint64_t>(red1) << 8) | (indices << 16);
+    }
+
+    // Place one recovered quadrant mean into the child texel grid.
+    inline void SetBC4Texel(BC4TexelBlock& texels, size_t texel, float value) noexcept
+    {
+        XMVECTOR& row = texels.rows[texel >> 2];
+        row = XMVectorSetByIndex(row, value, texel & 3);
+    }
+
+    // Fetch one mean texel with clamp-to-edge addressing.
+    inline float FetchBC4Mean(
+        const BC4BlockMean* source,
+        size_t width,
+        size_t height,
+        size_t x,
+        size_t y) noexcept
+    {
+        return source[std::min(y, height - 1) * width + std::min(x, width - 1)];
+    }
+
+    // Process one mip-1 block row directly from compressed parent blocks.
+    inline void ProcessCompressedRowBC4(
+        const Image& source,
+        Image& destination,
+        size_t destinationRow,
+        BC4BlockMean* sourceBlockMeans) noexcept
+    {
+        const size_t sourceBlockWidth = std::max<size_t>(1, (source.width + 3) / 4);
+        const size_t sourceBlockHeight = std::max<size_t>(1, (source.height + 3) / 4);
+        const size_t destinationBlockWidth = std::max<size_t>(1, (destination.width + 3) / 4);
+
+        // One destination block covers a 2x2 group of compressed source blocks.
+        const size_t sourceY0 = std::min(destinationRow * 2, sourceBlockHeight - 1);
+        const size_t sourceY1 = std::min(sourceY0 + 1, sourceBlockHeight - 1);
+        const auto* sourceRow0 = reinterpret_cast<const BC4Block*>(source.pixels + sourceY0 * source.rowPitch);
+        const auto* sourceRow1 = reinterpret_cast<const BC4Block*>(source.pixels + sourceY1 * source.rowPitch);
+        auto* destinationBlocks = reinterpret_cast<BC4Block*>(destination.pixels + destinationRow * destination.rowPitch);
+
+        // Each parent block collapses into one 2x2 texel corner of the destination block.
+        constexpr size_t parentBaseTexel[4] = { 0, 2, 8, 10 };
+        constexpr size_t quadrantTexelOffset[4] = { 0, 1, 4, 5 };
+
+        for (size_t destinationX = 0; destinationX < destinationBlockWidth; ++destinationX)
+        {
+            const size_t sourceX0 = std::min(destinationX * 2, sourceBlockWidth - 1);
+            const size_t sourceX1 = std::min(sourceX0 + 1, sourceBlockWidth - 1);
+
+            const uint64_t parents[4] =
+            {
+                LoadBC4Block(sourceRow0[sourceX0]),
+                LoadBC4Block(sourceRow0[sourceX1]),
+                LoadBC4Block(sourceRow1[sourceX0]),
+                LoadBC4Block(sourceRow1[sourceX1]),
+            };
+
+            // Every parent quadrant contributes exactly one child texel.
+            BC4TexelBlock texels{};
+            float parentMeans[4];
+
+            for (size_t parent = 0; parent < 4; ++parent)
+            {
+                float quadrants[4];
+                DecodeBC4QuadrantMeans(parents[parent], quadrants);
+
+                for (size_t quadrant = 0; quadrant < 4; ++quadrant)
+                {
+                    SetBC4Texel(texels, parentBaseTexel[parent] + quadrantTexelOffset[quadrant], quadrants[quadrant]);
+                }
+
+                // The block mean is the material of the higher-level mean pyramid.
+                parentMeans[parent] = (quadrants[0] + quadrants[1] + quadrants[2] + quadrants[3]) * 0.25f;
+            }
+
+            StoreBC4Block(EncodeBC4Block(texels), destinationBlocks[destinationX]);
+
+            if (sourceBlockMeans)
+            {
+                // Clamped addressing can make two parents refer to the same source block.
+                sourceBlockMeans[sourceY0 * sourceBlockWidth + sourceX0] = parentMeans[0];
+
+                if (sourceX1 != sourceX0)
+                {
+                    sourceBlockMeans[sourceY0 * sourceBlockWidth + sourceX1] = parentMeans[1];
+                }
+
+                if (sourceY1 != sourceY0)
+                {
+                    sourceBlockMeans[sourceY1 * sourceBlockWidth + sourceX0] = parentMeans[2];
+                    if (sourceX1 != sourceX0)
+                    {
+                        sourceBlockMeans[sourceY1 * sourceBlockWidth + sourceX1] = parentMeans[3];
+                    }
+                }
+            }
+        }
+    }
+
+    // Halve one row of the scalar block-mean image with edge clamping.
+    inline void DownsampleBC4MeanRow(
+        const BC4BlockMean* source,
+        size_t sourceWidth,
+        size_t sourceHeight,
+        BC4BlockMean* destination,
+        size_t destinationWidth,
+        size_t destinationRow) noexcept
+    {
+        // Select two source rows and repeat the final row when the height is odd.
+        const size_t sourceY0 = destinationRow * 2;
+        const size_t sourceY1 = std::min(sourceY0 + 1, sourceHeight - 1);
+        const auto* sourceRow0 = source + sourceY0 * sourceWidth;
+        const auto* sourceRow1 = source + sourceY1 * sourceWidth;
+        auto* destinationRowPtr = destination + destinationRow * destinationWidth;
+
+        for (size_t destinationX = 0; destinationX < destinationWidth; ++destinationX)
+        {
+            const size_t sourceX0 = destinationX * 2;
+            const size_t sourceX1 = std::min(sourceX0 + 1, sourceWidth - 1);
+
+            destinationRowPtr[destinationX] =
+                (sourceRow0[sourceX0] + sourceRow0[sourceX1] + sourceRow1[sourceX0] + sourceRow1[sourceX1]) * 0.25f;
+        }
+    }
+
+    // Encode one destination row from the scalar block-mean image.
+    inline void ProcessLinearRowBC4(
+        const BC4BlockMean* source,
+        size_t sourceWidth,
+        size_t sourceHeight,
+        Image& destination,
+        size_t destinationRow) noexcept
+    {
+        const size_t destinationBlockWidth = std::max<size_t>(1, (destination.width + 3) / 4);
+        auto* destinationBlocks = reinterpret_cast<BC4Block*>(destination.pixels + destinationRow * destination.rowPitch);
+
+        for (size_t destinationX = 0; destinationX < destinationBlockWidth; ++destinationX)
+        {
+            const size_t texelBaseX = destinationX * 4;
+            const size_t texelBaseY = destinationRow * 4;
+
+            // The mean pyramid grid already matches this level's texel grid.
+            BC4TexelBlock texels{};
+            for (size_t localY = 0; localY < 4; ++localY)
+            {
+                alignas(16) float values[4];
+                for (size_t localX = 0; localX < 4; ++localX)
+                {
+                    values[localX] = FetchBC4Mean(source, sourceWidth, sourceHeight, texelBaseX + localX, texelBaseY + localY);
+                }
+
+                texels.rows[localY] = _mm_load_ps(values);
+            }
+
+            StoreBC4Block(EncodeBC4Block(texels), destinationBlocks[destinationX]);
+        }
+    }
+
+    // Generate all compressed mip levels after level zero.
+    HRESULT GenerateCompressedMipMapsBC4(const Image& baseImage, ScratchImage& mipChain) noexcept
+    {
+        // Level 0 is already present, so a one-level chain requires no generation work.
+        const size_t mipLevels = mipChain.GetMetadata().mipLevels;
+        if (mipLevels <= 1)
+        {
+            return S_OK;
+        }
+
+        // Initialize the shared lookup table before entering an OpenMP region.
+        (void)GetBC4RowWeightTable();
+
+        const size_t baseBlockWidth = std::max<size_t>(1, (baseImage.width + 3) / 4);
+        const size_t baseBlockHeight = std::max<size_t>(1, (baseImage.height + 3) / 4);
+        std::unique_ptr<BC4BlockMean[]> meanImage;
+        std::unique_ptr<BC4BlockMean[]> meanScratch;
+
+        // Mip 1 is direct; later levels require two ping-pong mean buffers.
+        if (mipLevels > 2)
+        {
+            const size_t meanCount = baseBlockWidth * baseBlockHeight;
+            const size_t scratchWidth = (baseBlockWidth + 1) / 2;
+            const size_t scratchHeight = (baseBlockHeight + 1) / 2;
+            meanImage.reset(new (std::nothrow) BC4BlockMean[meanCount]{});
+            meanScratch.reset(new (std::nothrow) BC4BlockMean[scratchWidth * scratchHeight]{});
+            if (!meanImage || !meanScratch)
+            {
+                return E_OUTOFMEMORY;
+            }
+        }
+
+        BC4BlockMean* meanFront = meanImage.get();
+        BC4BlockMean* meanBack = meanScratch.get();
+        size_t meanWidth = baseBlockWidth;
+        size_t meanHeight = baseBlockHeight;
+
+        // BC4 stores linear scalar data, so no transfer curve is applied at any level.
+        for (size_t mipLevel = 1; mipLevel < mipLevels; ++mipLevel)
+        {
+            Image* destination = const_cast<Image*>(mipChain.GetImage(mipLevel, 0, 0));
+            if (!destination || !destination->pixels)
+            {
+                return E_FAIL;
+            }
+
+            const size_t destinationBlockHeight = std::max<size_t>(1, (destination->height + 3) / 4);
+
+            // Before mip 3 and later, halve the mean pyramid to the required scale.
+            if (mipLevel >= 3)
+            {
+                const size_t nextWidth = (meanWidth + 1) / 2;
+                const size_t nextHeight = (meanHeight + 1) / 2;
+
+            #ifdef _OPENMP
+            #pragma omp parallel for
+            #endif
+                for (ptrdiff_t row = 0; row < static_cast<ptrdiff_t>(nextHeight); ++row)
+                {
+                    DownsampleBC4MeanRow(meanFront, meanWidth, meanHeight, meanBack, nextWidth, static_cast<size_t>(row));
+                }
+
+                std::swap(meanFront, meanBack);
+                meanWidth = nextWidth;
+                meanHeight = nextHeight;
+            }
+
+        #ifdef _OPENMP
+        #pragma omp parallel for
+        #endif
+            for (ptrdiff_t row = 0; row < static_cast<ptrdiff_t>(destinationBlockHeight); ++row)
+            {
+                // Only mip 1 reads BC4 parents; later levels read the scalar mean pyramid.
+                if (mipLevel == 1)
+                {
+                    ProcessCompressedRowBC4(baseImage, *destination, static_cast<size_t>(row), meanFront);
+                }
+                else
+                {
+                    ProcessLinearRowBC4(meanFront, meanWidth, meanHeight, *destination, static_cast<size_t>(row));
+                }
+            }
+        }
+
+        return S_OK;
+    }
 
 } // namespace for bc4
 
@@ -5322,7 +5920,11 @@ HRESULT DirectX::GenerateCompressedMipMaps(const Image& baseImage, size_t levels
         }
         break;
 
-    // TODO: Add support for BC2, BC3, BC4, BC5, BC6H here in future extensions.
+    case DXGI_FORMAT_BC4_UNORM:
+        // Both BC4 interpolation modes are handled, so every block is supported.
+        break;
+
+    // TODO: Add support for BC2, BC3, BC5, BC6H here in future extensions.
     default:
         return HRESULT_E_NOT_SUPPORTED;
     }
@@ -5363,7 +5965,10 @@ HRESULT DirectX::GenerateCompressedMipMaps(const Image& baseImage, size_t levels
     case DXGI_FORMAT_BC7_UNORM_SRGB:
         return GenerateCompressedMipMapsBC7(baseImage, mipChain);
 
-    // TODO: Add case dispatches for BC2, BC3, BC4, BC5 here.
+    case DXGI_FORMAT_BC4_UNORM:
+        return GenerateCompressedMipMapsBC4(baseImage, mipChain);
+
+    // TODO: Add case dispatches for BC2, BC3, BC5 here.
     default:
         return HRESULT_E_NOT_SUPPORTED;
     }
