@@ -14,8 +14,12 @@ cbuffer MipConstants : register(b0)
     uint SourceHeight;
     uint DestinationWidth;
     uint DestinationHeight;
+
+    // 1 if the texture format is sRGB, 0 for linear
     uint IsSrgb;
+    // Selects the exact offset inside the shared output buffer to eliminate CPU readback stalls.
     uint DestinationOffset;
+    // Ensures the constant buffer is correctly aligned to 16-byte boundaries 
     uint2 Padding;
 };
 
@@ -66,6 +70,7 @@ void BuildPalette(uint2 block, out float3 palette[4])
     // Endpoint 0 occupies the low 16 bits and endpoint 1 occupies the high 16 bits.
     const uint color0 = block.x & 0xffffu;
     const uint color1 = block.x >> 16;
+
     // Unpack and expand both endpoints before applying BC1 integer interpolation.
     const uint3 raw0 = uint3((color0 >> 11) & 31u, (color0 >> 5) & 63u, color0 & 31u);
     const uint3 raw1 = uint3((color1 >> 11) & 31u, (color1 >> 5) & 63u, color1 & 31u);
@@ -76,9 +81,11 @@ void BuildPalette(uint2 block, out float3 palette[4])
     // Added 3-color mode fallback for endpoints where c0 <= c1
     const bool is4Color = color0 > color1;
     
+    // Palette entires 2 and 3 are calculated using 1/3 and 2/3 integer interpolation 
     const uint3 c4_2 = (2u * c0 + c1) / 3u;
     const uint3 c4_3 = (c0 + 2u * c1) / 3u;
     
+    // 3-color mode fallback interpolation (1/2 blend and pure black)
     const uint3 c3_2 = (c0 + c1) / 2u;
     const uint3 c3_3 = uint3(0u, 0u, 0u);
     
@@ -89,6 +96,7 @@ void BuildPalette(uint2 block, out float3 palette[4])
     float3 p1 = float3(c1) / 255.0f;
     float3 p2 = float3(c2) / 255.0f;
     float3 p3 = float3(c3) / 255.0f;
+
     // Hardware interpolation happens in code space; linearization happens afterward.
     if (IsSrgb != 0u)
     {
@@ -97,6 +105,8 @@ void BuildPalette(uint2 block, out float3 palette[4])
         p2 = float3(SrgbToLinear(p2.r), SrgbToLinear(p2.g), SrgbToLinear(p2.b));
         p3 = float3(SrgbToLinear(p3.r), SrgbToLinear(p3.g), SrgbToLinear(p3.b));
     }
+
+    // save
     palette[0] = p0;
     palette[1] = p1;
     palette[2] = p2;
@@ -106,24 +116,30 @@ void BuildPalette(uint2 block, out float3 palette[4])
 // Recover four 2x2 quadrant means and the full mean of one compressed parent block.
 void DecodeQuadrants(uint2 block, out float3 quadrants[4], out float3 blockMean)
 {
-    // The palette plus the selector bitmap is sufficient to compute means directly.
+    // Build the 4-color linear RGB pallette from the endpoints.
     float3 palette[4];
     BuildPalette(block, palette);
+
+    // This prevents branch instructions and index math overhead inside the shader ALUs.
     [unroll]
     for (uint quadrant = 0u; quadrant < 4u; ++quadrant)
     {
-        // Convert quadrant number 0..3 into its top-left texel coordinate.
+        // Convert quadrant number (0, 1, 2, 3) into its top-left texel X, Y coordinate.
         const uint baseX = (quadrant & 1u) * 2u;
         const uint baseY = (quadrant >> 1u) * 2u;
         float3 sum = 0.0f;
+
         [unroll]
         for (uint y = 0u; y < 2u; ++y)
         {
             [unroll]
             for (uint x = 0u; x < 2u; ++x)
             {
-                // Extract this texel's two-bit palette selector from the BC1 bitmap.
+                // Calculate the 1D texel index (0 to 15) inside the 4x4 block
                 const uint texel = (baseY + y) * 4u + baseX + x;
+
+                // Extract this specific texel's 2-bit palette selector from the 32-bit bitmap
+                // Shift right by (texel * 2) bits, then mask with 3 (binary 11) to get values 0..3. 
                 sum += palette[(block.y >> (texel * 2u)) & 3u];
             }
         }
@@ -173,9 +189,11 @@ uint2 EncodeSamples(float3 samples[16])
     }
     covariance *= 1.0f / 16.0f;
 
-    // One power-iteration step estimates the dominant color direction. The epsilon
-    // prevents normalize from receiving a zero vector for a perfectly flat block.
+    // Principal Component Analysis (PCA): Estimate the primary direction of color spread.
+    // We use a single 'Power iteration' step starting with a diagonal normalized vector (1, 1, 1) / sqrt(3).
     float3 axis = normalize(mul(covariance, float3(0.57735f, 0.57735f, 0.57735f)) + 1e-20f);
+
+    // project all 16 samples onto our principal axis to find the two most extreme color positions.
     float minimum = 10000.0f;
     float maximum = -10000.0f;
     [unroll]
@@ -190,18 +208,30 @@ uint2 EncodeSamples(float3 samples[16])
     // The projection extremes form the initial endpoint pair.
     float3 endpoint0 = mean + axis * minimum;
     float3 endpoint1 = mean + axis * maximum;
+
+    // Part 2: Least-Squares Endpoint Optimization ---
+
+    // we now have a line in 3D RGB space defined by endpoint 0 and endpoint 1.
     const float3 direction0 = endpoint1 - endpoint0;
+
     const float inverseLengthSquared = rcp(dot(direction0, direction0) + 1e-12f);
+
     float weightSum = 0.0f;
     float weightSquaredSum = 0.0f;
     float3 weighted = 0.0f;
+
     [unroll]
     // Temporarily assign each sample to the nearest continuous position on the
     // endpoint line, then snap it to one of BC1's four selector weights.
     for (uint s = 0u; s < 16u; ++s)
     {
+        // project the sample onto the line 
         float weight = saturate(dot(samples[s] - endpoint0, direction0) * inverseLengthSquared);
+
+        // BC1 only allows 4 palette colors, so the weight MUST be exactly 0, 1/3, 2/3, or 1.
         weight = round(weight * 3.0f) / 3.0f;
+
+        // Accumulate
         weightSum += weight;
         weightSquaredSum += weight * weight;
         weighted += weight * samples[s];
@@ -209,6 +239,7 @@ uint2 EncodeSamples(float3 samples[16])
 
     // Solve the two-endpoint least-squares normal equation with selectors fixed.
     const float determinant = 16.0f * weightSquaredSum - weightSum * weightSum;
+
     // A nearly singular system represents a flat block and safely collapses to its mean.
     if (determinant < 1e-6f)
     {
@@ -217,6 +248,7 @@ uint2 EncodeSamples(float3 samples[16])
     }
     else
     {
+        // the mathmatical sweet spot
         const float3 total = mean * 16.0f;
         endpoint0 = (weightSquaredSum * total - weightSum * weighted) / determinant;
         const float3 direction = (16.0f * weighted - weightSum * total) / determinant;

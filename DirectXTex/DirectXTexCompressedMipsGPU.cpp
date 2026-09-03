@@ -171,6 +171,11 @@ namespace
         ComPtr<ID3D11UnorderedAccessView>* uav,
         uint32_t& capacity) noexcept
     {
+        if (buffer != nullptr && capacity >= requiredCount)
+        {
+            return S_OK;
+        }
+
         // Force buffer recreation by always proceeding.
         HRESULT hr = CreateStructuredBuffer(device, stride, requiredCount, nullptr, buffer, srv, uav);
         if (SUCCEEDED(hr))
@@ -267,30 +272,46 @@ HRESULT DirectX::GenerateCompressedMipMaps(
     size_t levels,
     ScratchImage& mipChain) noexcept
 {
+    // Basic null pointer checks (ensure the device and image data exist)
     if (!device || !baseImage.pixels)
         return E_POINTER;
+    
+    // Compute Shader 5.0 requires DirectX 11.0 hardware or higher.
     if (device->GetFeatureLevel() < D3D_FEATURE_LEVEL_11_0)
         return HRESULT_E_NOT_SUPPORTED;
+
+    // This specific algorithm mathmatically relies on BC1 format characteristics.
+    // It ony supports BC1_UNORM and BC1_UNORM_SRGB formats.
     if (baseImage.format != DXGI_FORMAT_BC1_UNORM && baseImage.format != DXGI_FORMAT_BC1_UNORM_SRGB)
         return HRESULT_E_NOT_SUPPORTED;
+    
+    // BC1 can have a 3-color mode with 1-bit transarency (when color0 <= color1).
     if (!IsOpaqueBC1(baseImage))
         return HRESULT_E_NOT_SUPPORTED;
+
+    // Prevent integer overflow in GPU constant buffers.
     if (baseImage.width > UINT32_MAX || baseImage.height > UINT32_MAX)
         return E_INVALIDARG;
 
+    // Allocate memory for the entire mipmap chain based on the requested number of levels.
     HRESULT hr = mipChain.Initialize2D(baseImage.format, baseImage.width, baseImage.height, 1, levels);
     if (FAILED(hr))
         return hr;
 
+    // Retrieve the first level (mip 0) of the newly allocated chain.
     const Image* outputBase = mipChain.GetImage(0, 0, 0);
     if (!outputBase || outputBase->rowPitch != baseImage.rowPitch || outputBase->slicePitch != baseImage.slicePitch)
         return E_FAIL;
+    
+    // Copy the original base image directly into mip 0
     memcpy_s(outputBase->pixels, outputBase->slicePitch, baseImage.pixels, baseImage.slicePitch);
 
     const size_t mipLevels = mipChain.GetMetadata().mipLevels;
     if (mipLevels <= 1)
         return S_OK;
 
+    // Calculate the dimensions in terms of BC1 blocks (each block is 4x4 pixels).
+    // The sizes are rounded up to ensure full blocks for the edges.
     const uint32_t baseWidth = static_cast<uint32_t>(std::max<size_t>(1, (baseImage.width + 3) / 4));
     const uint32_t baseHeight = static_cast<uint32_t>(std::max<size_t>(1, (baseImage.height + 3) / 4));
     const uint64_t baseCount64 = uint64_t(baseWidth) * uint64_t(baseHeight);
@@ -298,7 +319,9 @@ HRESULT DirectX::GenerateCompressedMipMaps(
         return HRESULT_E_ARITHMETIC_OVERFLOW;
     const uint32_t baseCount = static_cast<uint32_t>(baseCount64);
 
-    // Pack rows tightly before uploading because a DDS row can contain padding.
+    // Tightly pack the BC1 blocks into a continuous buffer.
+    // This is necessary because DDS rows might have padding at the end of each row due to hardware alignment.
+    // Uploading memory with padding directly to the GPU would corrupt the comptue shader's addressing
     std::vector<BC1RawBlock> baseBlocks(baseCount);
     for (uint32_t y = 0; y < baseHeight; ++y)
     {
@@ -306,11 +329,13 @@ HRESULT DirectX::GenerateCompressedMipMaps(
             baseImage.pixels + size_t(y) * baseImage.rowPitch, size_t(baseWidth) * sizeof(BC1RawBlock));
     }
 
-    // Record each mip's position inside one shared output buffer. No readback is
-    // performed until every dispatch in the chain has been submitted.
+    // We use a "Single Shared Output Buffer" strategy to eliminate GPU->CPU readback stalls.
+    // Instead of reading back after each mip level, we dispatch everything and read back ONCE at the end.
     std::vector<MipReadbackLayout> layouts;
     layouts.reserve(mipLevels - 1);
     uint64_t totalOutputBlocks = 0;
+
+    // Loop throguh all generated mip levels (starting from mip 1) to calculate their sizes and offsets.
     for (size_t mipLevel = 1; mipLevel < mipLevels; ++mipLevel)
     {
         Image* destination = const_cast<Image*>(mipChain.GetImage(mipLevel, 0, 0));
@@ -331,14 +356,18 @@ HRESULT DirectX::GenerateCompressedMipMaps(
         totalOutputBlocks += blockCount;
     }
 
+    // Thread-local cache prevents recreating immutable shaders and helps reuse memory buffers.
+    // This is crucial for performance when processing hundreds of textures sequentially.
     thread_local GpuMipCache cache;
     hr = InitializeCache(device, cache);
     if (FAILED(hr)) return hr;
 
-    // Grow cached buffers only when a larger image requires more capacity.
+    // Ensure the base input buffer has enough capacity for the original mip 0 blocks.
     hr = EnsureStructuredBuffer(device, sizeof(BC1RawBlock), baseCount,
         cache.baseBuffer, &cache.baseSRV, nullptr, cache.baseCapacity);
     if (FAILED(hr)) return hr;
+    
+    // Ensure the single shared output buffer is larger enough for ALL generated mip levels combined.
     hr = EnsureOutputBuffers(device, static_cast<uint32_t>(totalOutputBlocks), cache);
     if (FAILED(hr)) return hr;
 
@@ -347,6 +376,8 @@ HRESULT DirectX::GenerateCompressedMipMaps(
     const uint64_t secondMeanCount64 = std::max<uint64_t>(1, halfWidth * halfHeight);
     if (secondMeanCount64 > UINT32_MAX)
         return HRESULT_E_ARITHMETIC_OVERFLOW;
+    
+    // Ensure the two ping-pong buffers are allocated 
     const uint32_t meanCounts[2] = { baseCount, static_cast<uint32_t>(secondMeanCount64) };
     for (size_t i = 0; i < 2; ++i)
     {
@@ -355,27 +386,35 @@ HRESULT DirectX::GenerateCompressedMipMaps(
         if (FAILED(hr)) return hr;
     }
 
-    // Since we now force buffer recreation, we can update the entire buffer at once.
+    // Upload the tightly packed mip 0 blocks to the GPU.
     cache.context->UpdateSubresource(cache.baseBuffer.Get(), 0, nullptr, baseBlocks.data(), 0, 0);
 
     size_t meanFront = 0;
     size_t meanBack = 1;
     uint32_t meanWidth = baseWidth;
     uint32_t meanHeight = baseHeight;
+    
+    // Dispatch Compute shaders loop: Build the mip chain level by level entrely on the GPU.
     for (size_t layoutIndex = 0; layoutIndex < layouts.size(); ++layoutIndex)
     {
         const size_t mipLevel = layoutIndex + 1;
         const MipReadbackLayout& layout = layouts[layoutIndex];
 
+        // Downsampling step: Starting form mip 3, we must halve the mean image before compressing it.
+        // Mip 2 doesn't need this because mip 1 already outputs the first properly sized mean image.
         if (mipLevel >= 3)
         {
             const uint32_t nextWidth = (meanWidth + 1u) / 2u;
             const uint32_t nextHeight = (meanHeight + 1u) / 2u;
             const MipConstants constants{ meanWidth, meanHeight, nextWidth, nextHeight,
                 IsSRGB(baseImage.format) ? 1u : 0u, 0u, {} };
+            
             cache.context->UpdateSubresource(cache.constantBuffer.Get(), 0, nullptr, &constants, 0, 0);
+            
             DispatchMipShader(cache.context.Get(), cache.downsampleShader.Get(), cache.constantBuffer.Get(), nullptr,
                 cache.meanSRVs[meanFront].Get(), nullptr, cache.meanUAVs[meanBack].Get(), nextWidth, nextHeight);
+            
+            // Swap ping-pong buffers for the next recursive iteration.
             std::swap(meanFront, meanBack);
             meanWidth = nextWidth;
             meanHeight = nextHeight;
@@ -387,12 +426,14 @@ HRESULT DirectX::GenerateCompressedMipMaps(
         cache.context->UpdateSubresource(cache.constantBuffer.Get(), 0, nullptr, &constants, 0, 0);
         if (mipLevel == 1)
         {
+            // Shader for Mip 1: Reads original BC1 blocks, output Mip 1 Bc1 blocks and a linear mean image.
             DispatchMipShader(cache.context.Get(), cache.mip1Shader.Get(), cache.constantBuffer.Get(),
                 cache.baseSRV.Get(), nullptr, cache.outputUAV.Get(), cache.meanUAVs[meanFront].Get(),
                 layout.blockWidth, layout.blockHeight);
         }
         else
         {
+            // Shader for Mip2+: Reads the linear mean image, output Mip N BC1 blocks
             DispatchMipShader(cache.context.Get(), cache.mipShader.Get(), cache.constantBuffer.Get(), nullptr,
                 cache.meanSRVs[meanFront].Get(), cache.outputUAV.Get(), nullptr,
                 layout.blockWidth, layout.blockHeight);
@@ -405,9 +446,12 @@ HRESULT DirectX::GenerateCompressedMipMaps(
     readbackBox.right = static_cast<uint32_t>(totalOutputBlocks * sizeof(BC1RawBlock));
     readbackBox.bottom = 1;
     readbackBox.back = 1;
+
     cache.context->CopySubresourceRegion(cache.stagingBuffer.Get(), 0, 0, 0, 0,
         cache.outputBuffer.Get(), 0, &readbackBox);
 
+
+    // Map the staging buffer to read the GPU results from CPU memory.
     D3D11_MAPPED_SUBRESOURCE mapped{};
     hr = cache.context->Map(cache.stagingBuffer.Get(), 0, D3D11_MAP_READ, 0, &mapped);
     if (FAILED(hr)) return hr;
@@ -423,6 +467,8 @@ HRESULT DirectX::GenerateCompressedMipMaps(
                 size_t(layout.blockWidth) * sizeof(BC1RawBlock));
         }
     }
+
+    // Clean
     cache.context->Unmap(cache.stagingBuffer.Get(), 0);
 
     return S_OK;

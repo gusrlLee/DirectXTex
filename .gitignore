@@ -50,3 +50,4 @@ x64
 /build/*.exe
 !**/skills/**
 data
+output
